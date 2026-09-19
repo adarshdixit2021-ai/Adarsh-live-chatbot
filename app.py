@@ -1,57 +1,64 @@
 import os
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import gspread
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+from google.oauth2.service_account import Credentials
 
 
 # =========================================================
-# PAGE CONFIGURATION
+# STREAMLIT UI CONFIGURATION
 # =========================================================
+
+try:
+    st.set_option("client.toolbarMode", "minimal")
+    st.set_option("client.showSidebarNavigation", False)
+except Exception:
+    pass
 
 st.set_page_config(
     page_title="Adarsh AI",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items={
+        "Get help": None,
+        "Report a bug": None,
+        "About": None,
+    },
 )
 
 
 # =========================================================
-# ENVIRONMENT
+# ENVIRONMENT / SECRETS
 # =========================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+load_dotenv()
 
-groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
-google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
-google_credentials_file = os.getenv(
-    "GOOGLE_CREDENTIALS_FILE", ""
-).strip()
-
-
-def get_credentials_path():
-    """Return an absolute path for the Google service-account JSON."""
-    if not google_credentials_file:
-        return None
-
-    path = Path(google_credentials_file).expanduser()
-
-    if not path.is_absolute():
-        path = BASE_DIR / path
-
-    return path.resolve()
-
+groq_api_key = os.getenv("GROQ_API_KEY")
+google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
 
 if not groq_api_key:
-    st.error("❌ GROQ_API_KEY is missing. Check your .env file.")
-    st.stop()
+    try:
+        groq_api_key = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        groq_api_key = None
 
+if not google_sheet_id:
+    try:
+        google_sheet_id = st.secrets["GOOGLE_SHEET_ID"]
+    except Exception:
+        google_sheet_id = None
+
+if not groq_api_key:
+    st.error(
+        "❌ Adarsh AI is not configured correctly. "
+        "GROQ_API_KEY is missing."
+    )
+    st.stop()
 
 client = Groq(api_key=groq_api_key)
 
@@ -60,176 +67,477 @@ client = Groq(api_key=groq_api_key)
 # SESSION STATE
 # =========================================================
 
-DEFAULTS = {
+defaults = {
     "messages": [],
     "chat_history": [],
     "user_profile": None,
     "show_login": False,
     "beginner_mode": True,
-    "web_search": True,
-    "feedback_message": "",
-    "feedback_rating": 5,
+    "web_search": False,
+    "feedback_sent": False,
 }
 
-for key, value in DEFAULTS.items():
+for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 
 # =========================================================
-# FEEDBACK WINDOW
+# CONSTANTS
 # =========================================================
+
+SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 
 FEEDBACK_START_DATE = date(2026, 9, 15)
 FEEDBACK_END_DATE = FEEDBACK_START_DATE + timedelta(days=10)
+
 feedback_available = date.today() <= FEEDBACK_END_DATE
 
 
 # =========================================================
-# GOOGLE SHEETS
+# HELPERS
 # =========================================================
 
-FEEDBACK_HEADERS = [
-    "Date & Time",
-    "Username",
-    "Feedback",
-    "Rating",
-    "Profession",
-    "Status",
-]
+def is_current_information_question(text):
+    """Use web search only for questions that clearly need fresh information."""
+    text = text.lower().strip()
+
+    current_words = [
+        "latest",
+        "today",
+        "currently",
+        "current",
+        "right now",
+        "recent",
+        "recently",
+        "this week",
+        "this month",
+        "this year",
+        "news",
+        "price today",
+        "live score",
+        "weather today",
+        "stock price",
+        "share price",
+        "what happened today",
+        "who is the current",
+        "current ceo",
+        "current president",
+        "current prime minister",
+    ]
+
+    return any(word in text for word in current_words)
 
 
-def get_feedback_sheet():
-    """
-    Connect to the first worksheet and return (worksheet, error).
-    No cached connection is used so credential/sheet changes take
-    effect immediately after restarting the app.
-    """
-    if not google_sheet_id:
-        return None, "GOOGLE_SHEET_ID is missing in .env."
+def clean_answer_for_display(answer):
+    """Prevent common LaTeX delimiters from appearing as raw text."""
+    answer = answer.replace(r"\(", "$")
+    answer = answer.replace(r"\)", "$")
+    answer = answer.replace(r"\[", "$$")
+    answer = answer.replace(r"\]", "$$")
+    answer = answer.replace("\\**", "**")
+    return answer.strip()
 
-    credentials_path = get_credentials_path()
 
-    if credentials_path is None:
-        return None, "GOOGLE_CREDENTIALS_FILE is missing in .env."
+def save_current_chat():
+    """Save the current conversation with a useful title."""
+    messages = st.session_state.messages
 
-    if not credentials_path.is_file():
-        return None, f"Credential file not found: {credentials_path}"
+    if not messages:
+        return
 
+    first_user_message = next(
+        (
+            message["content"]
+            for message in messages
+            if message["role"] == "user"
+        ),
+        "",
+    )
+
+    if not first_user_message:
+        return
+
+    title = " ".join(first_user_message.split())
+
+    if len(title) > 55:
+        title = title[:55].rstrip() + "..."
+
+    st.session_state.chat_history.append(
+        {
+            "id": datetime.now().timestamp(),
+            "title": title,
+            "messages": messages.copy(),
+            "pinned": False,
+        }
+    )
+
+
+def start_new_chat():
+    if st.session_state.messages:
+        save_current_chat()
+
+    st.session_state.messages = []
+
+
+def pin_chat(chat_id):
+    for chat in st.session_state.chat_history:
+        if chat["id"] == chat_id:
+            chat["pinned"] = not chat["pinned"]
+            break
+
+
+def delete_chat(chat_id):
+    st.session_state.chat_history = [
+        chat
+        for chat in st.session_state.chat_history
+        if chat["id"] != chat_id
+    ]
+
+
+def connect_google_sheet():
+    """Use Streamlit Secrets on Cloud or local JSON during local development."""
     try:
-        google_client = gspread.service_account(
-            filename=str(credentials_path)
-        )
+        if not google_sheet_id:
+            return None
 
-        spreadsheet = google_client.open_by_key(google_sheet_id)
-        worksheet = spreadsheet.sheet1
-
-        # Make sure the dedicated feedback sheet has the expected columns.
-        current_headers = worksheet.row_values(1)
-
-        if current_headers != FEEDBACK_HEADERS:
-            worksheet.update(
-                "A1:F1",
-                [FEEDBACK_HEADERS],
-                value_input_option="USER_ENTERED",
+        if "gcp_service_account" in st.secrets:
+            service_account_info = dict(
+                st.secrets["gcp_service_account"]
             )
 
-        return worksheet, None
+            credentials = Credentials.from_service_account_info(
+                service_account_info,
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive",
+                ],
+            )
 
-    except gspread.exceptions.SpreadsheetNotFound:
-        return None, (
-            "Google Sheet was not found or the service account "
-            "does not have access. Share the Sheet with the "
-            "service-account email as Editor."
-        )
+            google_client = gspread.authorize(credentials)
 
-    except gspread.exceptions.APIError as error:
-        return None, f"Google Sheets API error: {error}"
+        else:
+            google_credentials_file = os.getenv(
+                "GOOGLE_CREDENTIALS_FILE"
+            )
 
-    except Exception as error:
-        return None, str(error)
+            if not google_credentials_file:
+                return None
+
+            if not os.path.exists(google_credentials_file):
+                return None
+
+            google_client = gspread.service_account(
+                filename=google_credentials_file
+            )
+
+        spreadsheet = google_client.open_by_key(google_sheet_id)
+        return spreadsheet.sheet1
+
+    except Exception:
+        return None
+
+
+@st.cache_resource
+def get_google_sheet():
+    return connect_google_sheet()
 
 
 def save_feedback(feedback_text, rating):
-    """Append feedback to Google Sheets."""
-    worksheet, error = get_feedback_sheet()
+    worksheet = get_google_sheet()
 
     if worksheet is None:
-        return False, error
-
-    profile = st.session_state.user_profile
-
-    if profile:
-        user_name = profile.get("name", "Guest")
-        profession = profile.get("profession", "Not provided")
-    else:
-        user_name = "Guest"
-        profession = "Not provided"
-
-    india_time = datetime.now(ZoneInfo("Asia/Kolkata"))
-    formatted_time = india_time.strftime("%d %B %Y, %I:%M:%S %p")
+        return False
 
     try:
+        profile = st.session_state.user_profile
+
+        user_name = profile["name"] if profile else "Guest"
+        profession = profile["profession"] if profile else "Not provided"
+
+        india_time = datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        )
+
+        formatted_time = india_time.strftime(
+            "%d %B %Y, %I:%M:%S %p"
+        )
+
         worksheet.append_row(
             [
                 formatted_time,
                 user_name,
                 feedback_text.strip(),
-                int(rating),
+                rating,
                 profession,
                 "New",
             ],
             value_input_option="USER_ENTERED",
         )
-        return True, None
 
-    except gspread.exceptions.APIError as error:
-        return False, f"Google Sheets API error: {error}"
+        return True
 
-    except Exception as error:
-        return False, str(error)
+    except Exception:
+        return False
 
 
-# =========================================================
-# CHAT HISTORY
-# =========================================================
+def build_system_prompt():
+    return """
+You are Adarsh AI, a personal AI assistant developed by Adarsh Dixit.
 
-def save_current_chat():
-    if not st.session_state.messages:
-        return
+DEVELOPER IDENTITY:
+If asked who you are:
+"I'm Adarsh AI, a personal AI assistant developed by Adarsh Dixit."
 
-    first_question = next(
-        (
-            message["content"]
-            for message in st.session_state.messages
-            if message.get("role") == "user"
-        ),
-        "",
-    ).strip()
+If asked who your developer is:
+"My developer is Adarsh Dixit."
 
-    if not first_question:
-        return
+Adarsh Dixit is currently pursuing Bachelor of Computer Applications (BCA),
+specializing in Data Science and Artificial Intelligence.
 
-    chat_copy = [
+Do not claim that Adarsh Dixit created the underlying AI model.
+
+==================================================
+CORE ANSWER RULE
+==================================================
+
+Answer EXACTLY what the user asked.
+
+Do NOT add unrelated information.
+Do NOT repeat the question unnecessarily.
+Do NOT add random sections just to make the answer longer.
+Do NOT give unnecessary web results.
+Do NOT give unnecessary tables.
+Do NOT end with generic offers such as "Let me know if you need anything else."
+
+Use simple, beginner-friendly language.
+
+IMPORTANT KEYWORDS should be in **bold**.
+
+==================================================
+EDUCATIONAL / THEORY QUESTIONS
+==================================================
+
+When the user asks for a definition, concept, exam note, or theory answer:
+
+Use this structure when appropriate:
+
+### Definition
+Give a simple 1-3 sentence definition.
+
+### Key Points
+Give the most important points using short bullets.
+Bold important keywords.
+
+### Example
+Give 1 or 2 realistic real-life examples ONLY when they actually help.
+
+### Exam Answer
+Give a compact answer suitable for approximately 4 marks when the
+question looks like an academic/exam question.
+
+Do not force all four sections if the question is very simple.
+
+For a 4-mark answer:
+- Focus on definition + 3-4 key points.
+- Keep it organized.
+- Do not add unrelated advanced information.
+
+==================================================
+PROGRAMMING QUESTIONS
+==================================================
+
+For coding questions:
+
+1. Give the simplest correct solution first.
+2. Give code.
+3. Explain the important keywords/logic briefly.
+4. Give a small example/output when useful.
+
+Do not over-engineer beginner problems.
+
+For a simple Hello World question, prefer:
+print("Hello, World!")
+
+Do not unnecessarily create main functions/classes/frameworks.
+
+==================================================
+MATHEMATICS
+==================================================
+
+For mathematics:
+
+- Show the formula clearly.
+- Use readable Markdown/LaTeX.
+- Use $...$ for inline math.
+- Use $$...$$ for display equations.
+- NEVER use \(...\) or \[...\].
+- Solve step-by-step.
+- Do not leave raw LaTeX commands visible.
+
+==================================================
+FOLLOW-UP QUESTIONS
+==================================================
+
+Remember the recent conversation.
+
+If the user says "this", "that", "continue", "above", "same",
+or similar words, use the previous conversation context.
+
+==================================================
+CURRENT INFORMATION / WEB
+==================================================
+
+Only use web search when the user asks for information that genuinely
+needs current information, such as latest news, current prices, today's
+weather, current events, live scores, or recent developments.
+
+For normal educational, programming, mathematics, general knowledge,
+or conversational questions, answer directly without web search.
+
+Never invent current information or sources.
+
+==================================================
+TONE
+==================================================
+
+Be friendly, clear, concise and professional.
+
+Prefer:
+- Simple language
+- Short paragraphs
+- Bullet points
+- Bold keywords
+- Useful examples
+
+Avoid:
+- Unnecessary complexity
+- Repetition
+- Excessive headings
+- Irrelevant facts
+- Long introductions
+"""
+
+
+def get_chat_response(user_message):
+    recent_messages = st.session_state.messages[-12:]
+
+    messages_for_ai = [
         {
-            "role": message["role"],
-            "content": message["content"],
+            "role": "system",
+            "content": build_system_prompt(),
         }
-        for message in st.session_state.messages
     ]
 
-    # Do not save the exact same current chat repeatedly.
-    if st.session_state.chat_history:
-        last_chat = st.session_state.chat_history[-1]
-        if last_chat.get("messages") == chat_copy:
-            return
+    for message in recent_messages:
+        messages_for_ai.append(
+            {
+                "role": message["role"],
+                "content": message["content"],
+            }
+        )
 
-    st.session_state.chat_history.append(
-        {
-            "title": first_question[:45],
-            "messages": chat_copy,
-        }
+    needs_web = (
+        st.session_state.web_search
+        and is_current_information_question(user_message)
     )
+
+    if needs_web:
+        response = client.chat.completions.create(
+            model="groq/compound-mini",
+            messages=messages_for_ai,
+        )
+    else:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=messages_for_ai,
+            reasoning_effort="low",
+            max_tokens=2048,
+        )
+
+    answer = response.choices[0].message.content or ""
+
+    return clean_answer_for_display(answer), response, needs_web
+
+
+def extract_sources(response):
+    sources = []
+
+    try:
+        executed_tools = getattr(
+            response.choices[0].message,
+            "executed_tools",
+            None,
+        )
+
+        if not executed_tools:
+            return []
+
+        for tool in executed_tools:
+            search_results = getattr(
+                tool,
+                "search_results",
+                None,
+            )
+
+            if not search_results:
+                continue
+
+            if isinstance(search_results, dict):
+                results = search_results.get(
+                    "results",
+                    [],
+                )
+            else:
+                results = search_results
+
+            for result in results:
+                if isinstance(result, dict):
+                    title = result.get(
+                        "title",
+                        "Web Source",
+                    )
+                    url = result.get(
+                        "url",
+                        "",
+                    )
+                else:
+                    title = getattr(
+                        result,
+                        "title",
+                        "Web Source",
+                    )
+                    url = getattr(
+                        result,
+                        "url",
+                        "",
+                    )
+
+                if url:
+                    sources.append(
+                        (
+                            title,
+                            url,
+                        )
+                    )
+
+    except Exception:
+        return []
+
+    unique_sources = []
+    seen_urls = set()
+
+    for title, url in sources:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_sources.append(
+                (
+                    title,
+                    url,
+                )
+            )
+
+    return unique_sources[:5]
 
 
 # =========================================================
@@ -239,116 +547,134 @@ def save_current_chat():
 with st.sidebar:
 
     if st.session_state.user_profile:
-        user_name = st.session_state.user_profile["name"]
-        st.markdown(f"# 👤 {user_name}")
+        st.markdown(
+            f"## 👤 {st.session_state.user_profile['name']}"
+        )
+        st.caption("Your Personal AI Assistant")
     else:
-        st.markdown("# 🤖 Adarsh AI")
+        st.markdown("## 🤖 Adarsh AI")
+        st.caption("Your Personal AI Assistant")
 
-    st.caption("Your Personal AI Assistant")
     st.divider()
 
     # -----------------------------------------------------
-    # LOGIN / PROFILE
+    # PROFILE
     # -----------------------------------------------------
 
-    if st.session_state.user_profile is None:
+    with st.expander("👤 Profile", expanded=False):
 
-        if st.button("👤 User Login", use_container_width=True):
-            st.session_state.show_login = (
-                not st.session_state.show_login
-            )
-            st.rerun()
+        if st.session_state.user_profile:
 
-        if st.session_state.show_login:
-            st.markdown("### 👤 Create Profile")
-            st.caption("Enter your basic information.")
-
-            login_name = st.text_input(
-                "Name",
-                placeholder="Enter your name",
-                key="login_name",
-            )
-
-            login_dob = st.date_input(
-                "Date of Birth",
-                value=date(2000, 1, 1),
-                min_value=date(1900, 1, 1),
-                max_value=date.today(),
-                key="login_dob",
-            )
-
-            login_gender = st.selectbox(
-                "Gender",
-                [
-                    "Select Gender",
-                    "Male",
-                    "Female",
-                    "Other",
-                    "Prefer not to say",
-                ],
-                key="login_gender",
-            )
-
-            login_profession = st.text_input(
-                "Profession",
-                placeholder="e.g. Student, Developer",
-                key="login_profession",
-            )
-
-            if st.button("✅ Submit", use_container_width=True):
-                if not login_name.strip():
-                    st.warning("⚠️ Please enter your name.")
-                elif login_gender == "Select Gender":
-                    st.warning("⚠️ Please select your gender.")
-                elif not login_profession.strip():
-                    st.warning("⚠️ Please enter your profession.")
-                else:
-                    st.session_state.user_profile = {
-                        "name": login_name.strip(),
-                        "dob": login_dob.strftime("%d %B %Y"),
-                        "gender": login_gender,
-                        "profession": login_profession.strip(),
-                    }
-                    st.session_state.show_login = False
-                    st.toast("✅ Welcome to Adarsh AI!")
-                    st.rerun()
-
-    else:
-
-        if st.button("✏️ Edit Profile", use_container_width=True):
             profile = st.session_state.user_profile
 
-            st.session_state.edit_name = profile.get("name", "")
-            st.session_state.edit_dob = datetime.strptime(
-                profile.get("dob", "01 January 2000"),
-                "%d %B %Y",
-            ).date()
-            st.session_state.edit_gender = profile.get(
-                "gender", "Prefer not to say"
+            st.write(f"**Name:** {profile['name']}")
+            st.write(f"**Date of Birth:** {profile['dob']}")
+            st.write(f"**Gender:** {profile['gender']}")
+            st.write(f"**Profession:** {profile['profession']}")
+
+            if st.button(
+                "✏️ Edit Profile",
+                use_container_width=True,
+            ):
+                st.session_state.show_login = True
+                st.session_state.user_profile = None
+                st.rerun()
+
+        else:
+
+            st.caption(
+                "Create your profile for a personalized experience."
             )
-            st.session_state.edit_profession = profile.get(
-                "profession", ""
-            )
-            st.session_state.show_login = True
-            st.session_state.user_profile = None
-            st.rerun()
+
+            if st.button(
+                "👤 Create Profile",
+                use_container_width=True,
+            ):
+                st.session_state.show_login = True
+                st.rerun()
+
+    # -----------------------------------------------------
+    # LOGIN FORM
+    # -----------------------------------------------------
+
+    if (
+        st.session_state.show_login
+        and st.session_state.user_profile is None
+    ):
+
+        st.markdown("### Create Profile")
+
+        user_name = st.text_input(
+            "Name",
+            placeholder="Enter your name",
+            key="login_name",
+        )
+
+        user_dob = st.date_input(
+            "Date of Birth",
+            value=date(2000, 1, 1),
+            min_value=date(1900, 1, 1),
+            max_value=date.today(),
+            key="login_dob",
+        )
+
+        user_gender = st.selectbox(
+            "Gender",
+            [
+                "Select Gender",
+                "Male",
+                "Female",
+                "Other",
+                "Prefer not to say",
+            ],
+            key="login_gender",
+        )
+
+        user_profession = st.text_input(
+            "Profession",
+            placeholder="e.g. Student, Developer",
+            key="login_profession",
+        )
+
+        if st.button(
+            "✅ Save Profile",
+            use_container_width=True,
+        ):
+
+            if not user_name.strip():
+                st.warning("Please enter your name.")
+
+            elif user_gender == "Select Gender":
+                st.warning("Please select your gender.")
+
+            elif not user_profession.strip():
+                st.warning("Please enter your profession.")
+
+            else:
+                st.session_state.user_profile = {
+                    "name": user_name.strip(),
+                    "dob": user_dob.strftime("%d %B %Y"),
+                    "gender": user_gender,
+                    "profession": user_profession.strip(),
+                }
+
+                st.session_state.show_login = False
+
+                st.success("Profile saved.")
+                st.rerun()
 
     st.divider()
 
     # -----------------------------------------------------
-    # CHAT CONTROLS
+    # NEW CHAT
     # -----------------------------------------------------
 
-    if st.button("➕ New Chat", use_container_width=True):
-        save_current_chat()
-        st.session_state.messages = []
+    if st.button(
+        "➕ New Chat",
+        use_container_width=True,
+    ):
+        start_new_chat()
         st.rerun()
-
-    if st.button("🗑️ Clear Current Chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-
-    st.divider()
 
     # -----------------------------------------------------
     # CHAT HISTORY
@@ -357,105 +683,174 @@ with st.sidebar:
     st.markdown("### 💬 Chat History")
 
     if not st.session_state.chat_history:
-        st.caption("No previous chats yet.")
+
+        st.caption("No saved chats yet.")
+
     else:
-        for index, chat in enumerate(
-            reversed(st.session_state.chat_history)
-        ):
-            if st.button(
-                f"💬 {chat['title']}",
-                key=f"history_{index}",
-                use_container_width=True,
-            ):
-                st.session_state.messages = [
-                    message.copy()
-                    for message in chat["messages"]
-                ]
-                st.rerun()
 
-    st.divider()
+        pinned_chats = [
+            chat
+            for chat in st.session_state.chat_history
+            if chat.get("pinned")
+        ]
 
-    # -----------------------------------------------------
-    # HELP & FEEDBACK
-    # -----------------------------------------------------
+        normal_chats = [
+            chat
+            for chat in st.session_state.chat_history
+            if not chat.get("pinned")
+        ]
 
-    if feedback_available:
-        with st.expander("📣 Help & Feedback", expanded=False):
-            st.markdown("### 💬 Help improve Adarsh AI")
-            st.caption(
-                "Found a problem or have an idea? Tell us what you think."
+        ordered_chats = pinned_chats + list(
+            reversed(normal_chats)
+        )
+
+        for index, chat in enumerate(ordered_chats):
+
+            row1, row2, row3 = st.columns(
+                [7, 1, 1],
+                gap="small",
             )
 
-            with st.form("feedback_form", clear_on_submit=True):
-                feedback_text = st.text_area(
-                    "Your Feedback",
-                    placeholder=(
-                        "Describe a bug, problem, suggestion "
-                        "or anything you would like to improve..."
-                    ),
-                    height=120,
-                )
+            with row1:
 
-                feedback_rating = st.slider(
-                    "⭐ Rate Adarsh AI",
-                    min_value=1,
-                    max_value=5,
-                    value=5,
-                )
+                prefix = "📌 " if chat.get("pinned") else "💬 "
 
-                submit_feedback = st.form_submit_button(
-                    "📤 Submit Feedback",
+                if st.button(
+                    prefix + chat["title"],
+                    key=f"open_chat_{chat['id']}_{index}",
                     use_container_width=True,
-                )
+                ):
 
-            if submit_feedback:
-                if not feedback_text.strip():
-                    st.warning("⚠️ Please enter your feedback.")
-                else:
-                    with st.spinner("📤 Saving your feedback..."):
-                        saved, error = save_feedback(
-                            feedback_text,
-                            feedback_rating,
-                        )
+                    st.session_state.messages = (
+                        chat["messages"].copy()
+                    )
 
-                    if saved:
-                        st.success(
-                            "✅ Thank you! Your feedback has been submitted."
-                        )
-                    else:
-                        st.error("❌ Feedback could not be saved.")
-                        with st.expander("🔧 See the exact reason"):
-                            st.code(error or "Unknown Google Sheets error")
+                    st.rerun()
+
+            with row2:
+
+                if st.button(
+                    "📌",
+                    key=f"pin_chat_{chat['id']}_{index}",
+                    help="Pin / unpin chat",
+                ):
+
+                    pin_chat(chat["id"])
+                    st.rerun()
+
+            with row3:
+
+                if st.button(
+                    "🗑️",
+                    key=f"delete_chat_{chat['id']}_{index}",
+                    help="Delete chat",
+                ):
+
+                    delete_chat(chat["id"])
+                    st.rerun()
+
+    if st.session_state.chat_history:
+
+        if st.button(
+            "🗑️ Delete All History",
+            use_container_width=True,
+        ):
+            st.session_state.chat_history = []
+            st.rerun()
+
+    st.divider()
 
     # -----------------------------------------------------
     # SETTINGS
     # -----------------------------------------------------
 
     with st.expander("⚙️ Settings", expanded=False):
-        st.markdown("#### 🎛️ Chat Settings")
 
         st.session_state.beginner_mode = st.toggle(
-            "👶 Beginner Mode",
+            "👶 Beginner-friendly answers",
             value=st.session_state.beginner_mode,
+            help="Keeps explanations simple and exam-friendly.",
         )
 
         st.session_state.web_search = st.toggle(
-            "🌐 Web Search",
+            "🌐 Current information search",
             value=st.session_state.web_search,
-        )
-
-        st.divider()
-
-        st.caption(
-            "👶 Simple explanations are enabled."
-            if st.session_state.beginner_mode
-            else "🎓 Advanced explanations are enabled."
+            help=(
+                "Search is used only for questions that need "
+                "current information."
+            ),
         )
 
         st.caption(
-            "🌐 Current information search is enabled."
-            if st.session_state.web_search
-            else "⚡ Fast AI mode is enabled. Web Search is off."
+            "🎨 Light/Dark theme is controlled by Streamlit's "
+            "native theme and your device/browser preference. "
+            "The app does not inject custom HTML/CSS."
+        )
+
+    # -----------------------------------------------------
+    # HELP & SUPPORT
+    # -----------------------------------------------------
+
+    if feedback_available:
+
+        with st.expander(
+            "📣 Help & Feedback",
+            expanded=False,
+        ):
+
+            feedback_text = st.text_area(
+                "Your Feedback",
+                placeholder=(
+                    "Tell us about a bug, problem or suggestion..."
+                ),
+                height=110,
+            )
+
+            feedback_rating = st.slider(
+                "⭐ Rating",
+                min_value=1,
+                max_value=5,
+                value=5,
+            )
+
+            if st.button(
+                "📤 Submit Feedback",
+                use_container_width=True,
+            ):
+
+                if not feedback_text.strip():
+
+                    st.warning("Please enter your feedback.")
+
+                elif save_feedback(
+                    feedback_text,
+                    feedback_rating,
+                ):
+
+                    st.success(
+                        "✅ Thank you! Your feedback has been submitted."
+                    )
+
+                else:
+
+                    st.error(
+                        "❌ Feedback could not be saved right now."
+                    )
+
+    with st.expander("🆘 Support", expanded=False):
+
+        st.write(
+            "For support, bugs or project-related questions:"
+        )
+
+        st.markdown(
+            f"📧 **{SUPPORT_EMAIL}**"
+        )
+
+        st.link_button(
+            "✉️ Email Support",
+            f"mailto:{SUPPORT_EMAIL}",
+            use_container_width=True,
         )
 
     st.divider()
@@ -466,370 +861,284 @@ with st.sidebar:
 
 
 # =========================================================
-# MAIN SCREEN
+# MAIN CONTENT
 # =========================================================
 
 if st.session_state.user_profile:
-    profile = st.session_state.user_profile
 
-    st.markdown(f"# 🤖 Welcome, {profile['name']}!")
-    st.markdown("### Your Personal AI Assistant")
-    st.caption("💡 Ask questions • Learn • Explore • Get answers")
-    st.divider()
+    name = st.session_state.user_profile["name"]
 
     if not st.session_state.messages:
-        st.markdown("### 👤 Your Profile")
 
-        col1, col2 = st.columns(2)
+        st.markdown(
+            f"# 🤖 Hi {name}!"
+        )
+
+        st.markdown(
+            "### Your Personal AI Assistant"
+        )
+
+        st.caption(
+            "Ask a question and get a clear, organized answer."
+        )
+
+        st.divider()
+
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             st.info(
-                f"**👤 Name**\n\n{profile['name']}\n\n"
-                f"**🎂 Date of Birth**\n\n{profile['dob']}"
+                "**📚 Learn**\n\n"
+                "Simple definitions, key points and examples."
             )
 
         with col2:
             st.info(
-                f"**⚧️ Gender**\n\n{profile['gender']}\n\n"
-                f"**💼 Profession**\n\n{profile['profession']}"
+                "**💻 Code**\n\n"
+                "Simple solutions with useful explanations."
+            )
+
+        with col3:
+            st.info(
+                "**🌐 Current Info**\n\n"
+                "Search current information when needed."
             )
 
         st.divider()
-        st.markdown("### ✨ What can I help you with today?")
-        st.write(
-            "Ask me about programming, technology, Artificial Intelligence, "
-            "Data Science, education, current information, or general topics."
-        )
 
-        card1, card2, card3 = st.columns(3)
-
-        with card1:
-            st.info("🤖 **AI Assistant**\n\nAsk questions and get clear answers.")
-
-        with card2:
-            st.info("📚 **Learning**\n\nUnderstand concepts step-by-step.")
-
-        with card3:
-            st.info("🌐 **Live Information**\n\nUse Web Search when you need current information.")
-
-        st.divider()
         st.markdown("### 💡 Try asking")
 
-        ex1, ex2 = st.columns(2)
+        st.write(
+            "• What is inheritance in Java?"
+        )
+        st.write(
+            "• Explain matrices for 4 marks."
+        )
+        st.write(
+            "• Write a simple Python program to reverse a string."
+        )
 
-        with ex1:
-            st.write("🐍 Explain Python loops for beginners")
-            st.write("☕ What is inheritance in Java?")
-            st.write("⚛️ Explain React props simply")
+    else:
 
-        with ex2:
-            st.write("🤖 What is Artificial Intelligence?")
-            st.write("💻 Write a simple Java program")
-            st.write("📱 What is the latest smartphone price?")
+        st.markdown(
+            "# 🤖 Adarsh AI"
+        )
 
+        st.caption(
+            "Clear answers. Simple explanations. No unnecessary information."
+        )
 
 else:
+
     st.markdown("# 🤖 Adarsh AI")
-    st.markdown("### Your Personal AI Assistant")
-    st.caption("💡 Ask questions • Learn • Explore • Get answers")
-    st.divider()
 
-    st.markdown("## 👋 Welcome to Adarsh AI")
-    st.write(
-        "Your personal AI assistant for learning, programming, technology "
-        "and everyday questions."
+    st.markdown(
+        "### Your Personal AI Assistant"
     )
-    st.write("Please use **👤 User Login** in the sidebar to get started.")
+
+    st.caption(
+        "Ask questions • Learn • Explore • Get answers"
+    )
 
     st.divider()
 
-    col1, col2, col3 = st.columns(3)
+    st.markdown(
+        "## 👋 Welcome"
+    )
 
-    with col1:
-        st.info("🤖 **AI Assistant**\n\nAsk questions and get clear answers.")
+    st.write(
+        "Ask me about programming, mathematics, technology, "
+        "Artificial Intelligence, Data Science or everyday questions."
+    )
 
-    with col2:
-        st.info("📚 **Learning**\n\nUnderstand concepts step-by-step.")
-
-    with col3:
-        st.info("🌐 **Live Information**\n\nSearch current information.")
+    st.info(
+        "👤 Create a profile from the sidebar if you want "
+        "a personalized experience."
+    )
 
 
 # =========================================================
-# DISPLAY CHAT
+# RENDER EXISTING CHAT
 # =========================================================
 
 for message in st.session_state.messages:
-    role = message.get("role")
-    content = message.get("content", "")
 
-    if role == "user":
-        with st.chat_message("user", avatar="👤"):
-            st.write(content)
+    if message["role"] == "user":
 
-    elif role == "assistant":
-        with st.chat_message("assistant", avatar="🤖"):
-            st.markdown(content)
+        with st.chat_message(
+            "user",
+            avatar="👤",
+        ):
+
+            st.write(message["content"])
+
+    else:
+
+        with st.chat_message(
+            "assistant",
+            avatar="🤖",
+        ):
+
+            st.markdown(message["content"])
+
+            with st.expander(
+                "📋 Copy answer",
+                expanded=False,
+            ):
+
+                st.code(
+                    message["content"],
+                    language="markdown",
+                )
 
 
 # =========================================================
 # CHAT INPUT
 # =========================================================
 
-user_message = st.chat_input("💬 Ask Adarsh AI anything...")
+user_message = st.chat_input(
+    "💬 Ask Adarsh AI anything..."
+)
 
 
 # =========================================================
-# AI SYSTEM INSTRUCTION
+# PROCESS NEW QUESTION
 # =========================================================
 
 if user_message:
 
     st.session_state.messages.append(
-        {"role": "user", "content": user_message}
+        {
+            "role": "user",
+            "content": user_message,
+        }
     )
 
-    with st.chat_message("user", avatar="👤"):
+    with st.chat_message(
+        "user",
+        avatar="👤",
+    ):
+
         st.write(user_message)
 
-    if st.session_state.beginner_mode:
-        level_instruction = """
-Always explain in simple, beginner-friendly language.
-Give the simplest working solution first.
-For programming, avoid unnecessary functions, classes,
-frameworks and complexity.
-For a simple Hello World question, prefer:
-print("Hello, World!")
-Do not unnecessarily create main() or
-if __name__ == "__main__": unless requested.
-"""
-    else:
-        level_instruction = """
-Give technically accurate explanations appropriate for
-an experienced learner. Still keep the answer clear and organized.
-"""
-
-    system_instruction = f"""
-You are Adarsh AI, a personal AI assistant developed by Adarsh Dixit.
-
-Developer information:
-Adarsh Dixit is currently pursuing a Bachelor of Computer
-Applications (BCA), specializing in Data Science and
-Artificial Intelligence.
-
-IDENTITY:
-- If asked "Who are you?", say:
-  "I'm Adarsh AI, a personal AI assistant developed by Adarsh Dixit."
-- If asked who created/developed you, say:
-  "My developer is Adarsh Dixit."
-- If asked for more developer information, give the BCA/Data Science &
-  AI information above.
-- Never claim Adarsh Dixit created the underlying AI model or infrastructure.
-- Do not mention the underlying AI provider unless the user specifically
-  asks about the technical implementation.
-
-{level_instruction}
-
-CONVERSATION:
-Use the recent conversation context for follow-up questions.
-Understand references such as "this", "that", "it", "same", "continue",
-"previous" and "above".
-
-CURRENT INFORMATION:
-When web search is available and the user asks for current information,
-use it. Never invent facts or sources.
-
-ANSWER STYLE:
-Be friendly, professional and clear.
-Use headings, bullets and examples when useful.
-Keep simple questions concise.
-Give detail when necessary.
-"""
-
-    # Keep the full conversation visible locally, but send only a
-    # bounded recent context to prevent oversized API requests.
-    MAX_CONTEXT_MESSAGES = 8
-    MAX_MESSAGE_CHARS = 5000
-
-    recent_messages = st.session_state.messages[-MAX_CONTEXT_MESSAGES:]
-
-    messages_for_ai = [{"role": "system", "content": system_instruction}]
-
-    for message in recent_messages:
-        content = str(message.get("content", ""))
-
-        if len(content) > MAX_MESSAGE_CHARS:
-            content = content[-MAX_MESSAGE_CHARS:]
-
-        messages_for_ai.append(
-            {
-                "role": message["role"],
-                "content": content,
-            }
-        )
-
-    # =====================================================
-    # GENERATE RESPONSE
-    # =====================================================
-
-    with st.chat_message("assistant", avatar="🤖"):
+    with st.chat_message(
+        "assistant",
+        avatar="🤖",
+    ):
 
         try:
 
-            # -------------------------------------------------
-            # WEB SEARCH / GROQ COMPOUND
-            # -------------------------------------------------
+            needs_web = (
+                st.session_state.web_search
+                and is_current_information_question(
+                    user_message
+                )
+            )
 
-            if st.session_state.web_search:
+            if needs_web:
 
-                with st.status(
-                    "⚡ Searching and thinking...",
-                    expanded=False,
+                with st.spinner(
+                    "🔎 Finding current information..."
                 ):
-                    response = client.chat.completions.create(
-                        model="groq/compound",
-                        messages=messages_for_ai,
+
+                    answer, response, used_web = (
+                        get_chat_response(
+                            user_message
+                        )
                     )
-
-                answer = response.choices[0].message.content or ""
-
-                if not answer:
-                    answer = "Sorry, I couldn't generate an answer."
-
-                st.markdown(answer)
-
-            # -------------------------------------------------
-            # FAST MODE WITH STREAMING
-            # -------------------------------------------------
 
             else:
 
-                with st.status(
-                    "⚡ Adarsh AI is thinking...",
-                    expanded=False,
+                with st.spinner(
+                    "🧠 Thinking..."
                 ):
-                    stream = client.chat.completions.create(
-                        model="openai/gpt-oss-120b",
-                        messages=messages_for_ai,
-                        temperature=0.3,
-                        max_tokens=2048,
-                        stream=True,
+
+                    answer, response, used_web = (
+                        get_chat_response(
+                            user_message
+                        )
                     )
 
-                    answer_parts = []
-                    answer_placeholder = st.empty()
-
-                    for chunk in stream:
-                        try:
-                            delta = chunk.choices[0].delta.content
-                        except (AttributeError, IndexError):
-                            delta = None
-
-                        if delta:
-                            answer_parts.append(delta)
-                            answer_placeholder.markdown(
-                                "".join(answer_parts) + "▌"
-                            )
-
-                    answer = "".join(answer_parts).strip()
-
-                answer_placeholder.markdown(
-                    answer or "Sorry, I couldn't generate an answer."
-                )
-
-                if not answer:
-                    answer = "Sorry, I couldn't generate an answer."
-
-            # -------------------------------------------------
-            # SAVE ANSWER
-            # -------------------------------------------------
+            st.markdown(answer)
 
             st.session_state.messages.append(
-                {"role": "assistant", "content": answer}
+                {
+                    "role": "assistant",
+                    "content": answer,
+                }
             )
 
-            # -------------------------------------------------
-            # WEB SOURCES
-            # -------------------------------------------------
+            with st.expander(
+                "📋 Copy answer",
+                expanded=False,
+            ):
 
-            if st.session_state.web_search:
-                message_data = response.choices[0].message
-                executed_tools = getattr(
-                    message_data,
-                    "executed_tools",
-                    None,
+                st.code(
+                    answer,
+                    language="markdown",
                 )
 
-                sources = []
+            if used_web:
 
-                if executed_tools:
-                    for tool in executed_tools:
-                        search_results = getattr(
-                            tool,
-                            "search_results",
-                            None,
-                        )
+                sources = extract_sources(response)
 
-                        if not search_results:
-                            continue
+                if sources:
 
-                        if isinstance(search_results, dict):
-                            results = search_results.get("results", [])
-                        else:
-                            results = search_results
-
-                        for result in results:
-                            if isinstance(result, dict):
-                                title = result.get("title", "Web Source")
-                                url = result.get("url", "")
-                            else:
-                                title = getattr(
-                                    result,
-                                    "title",
-                                    "Web Source",
-                                )
-                                url = getattr(result, "url", "")
-
-                            if url:
-                                sources.append((title, url))
-
-                unique_sources = []
-                seen_urls = set()
-
-                for title, url in sources:
-                    if url not in seen_urls:
-                        seen_urls.add(url)
-                        unique_sources.append((title, url))
-
-                if unique_sources:
-                    st.divider()
-                    st.markdown("### 📚 Sources")
-
-                    for index, (title, url) in enumerate(
-                        unique_sources,
-                        start=1,
+                    with st.expander(
+                        "📚 Sources",
+                        expanded=False,
                     ):
-                        st.markdown(
-                            f"{index}. [{title}]({url})"
-                        )
+
+                        for source_index, (
+                            title,
+                            url,
+                        ) in enumerate(
+                            sources,
+                            start=1,
+                        ):
+
+                            st.markdown(
+                                f"{source_index}. "
+                                f"[{title}]({url})"
+                            )
 
         except Exception as error:
 
-            # Remove the failed user message so the next retry does
-            # not resend a broken request as if it were successful.
-            if (
-                st.session_state.messages
-                and st.session_state.messages[-1].get("role") == "user"
-                and st.session_state.messages[-1].get("content") == user_message
-            ):
-                st.session_state.messages.pop()
+            error_text = str(error).lower()
 
-            error_text = str(error)
+            if "401" in error_text or "authentication" in error_text:
 
-            st.error(
-                "❌ I couldn't complete that request. "
-                "Please try again."
-            )
+                friendly_error = (
+                    "❌ The AI service authentication failed. "
+                    "Please check the API key in Streamlit Secrets."
+                )
 
-            with st.expander("🔧 Technical Details"):
-                st.code(error_text)
+            elif "429" in error_text or "rate limit" in error_text:
+
+                friendly_error = (
+                    "⏳ The AI service is temporarily rate-limited. "
+                    "Please wait a moment and try again."
+                )
+
+            elif "413" in error_text:
+
+                friendly_error = (
+                    "⚠️ The conversation became too large. "
+                    "Start a New Chat and try again."
+                )
+
+            elif "timeout" in error_text:
+
+                friendly_error = (
+                    "⏱️ The request took too long. "
+                    "Please try again."
+                )
+
+            else:
+
+                friendly_error = (
+                    "❌ I couldn't generate the answer right now. "
+                    "Please try again."
+                )
+
+            st.error(friendly_error)
