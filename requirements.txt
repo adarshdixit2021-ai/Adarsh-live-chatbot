@@ -1,5 +1,10 @@
-streamlit
+streamlit>=1.49.0
 python-dotenv
 groq
 gspread
 google-auth
+requests
+beautifulsoup4
+scikit-learn
+mysql-connector-python
+Pillow
