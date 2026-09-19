@@ -371,7 +371,7 @@ For mathematics:
 - Use readable Markdown/LaTeX.
 - Use $...$ for inline math.
 - Use $$...$$ for display equations.
-- NEVER use \(...\) or \[...\].
+- NEVER use round-bracket LaTeX delimiters or square-bracket LaTeX delimiters.
 - Solve step-by-step.
 - Do not leave raw LaTeX commands visible.
 
