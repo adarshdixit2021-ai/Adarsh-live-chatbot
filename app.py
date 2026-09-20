@@ -59,59 +59,24 @@ def _clean_config_value(value, default=None):
 
 
 def _get_secret_value(key, default=None):
-    """Read Streamlit Secrets robustly across flat and grouped TOML layouts."""
-    def _lookup(mapping, wanted_key):
-        if mapping is None:
-            return None
+    """Read a Streamlit secret safely, supporting both flat and grouped secrets."""
+    try:
+        value = st.secrets.get(key)
+        if value is not None:
+            return value
+    except Exception:
+        pass
 
-        # Direct lookup first.
-        try:
-            value = mapping.get(wanted_key)
+    # Also support an optional [mysql] section in Streamlit Secrets.
+    try:
+        mysql_section = st.secrets.get("mysql")
+        if mysql_section and key.startswith("MYSQL_"):
+            short_key = key[6:].lower()
+            value = mysql_section.get(short_key)
             if value is not None:
                 return value
-        except Exception:
-            pass
-
-        try:
-            value = mapping[wanted_key]
-            if value is not None:
-                return value
-        except Exception:
-            pass
-
-        # Streamlit/TOML keys are normally case-sensitive, so also check
-        # case-insensitively. This makes deployment resilient to accidental
-        # lowercase/uppercase secret names.
-        try:
-            for existing_key in mapping.keys():
-                if str(existing_key).strip().lower() == wanted_key.lower():
-                    value = mapping[existing_key]
-                    if value is not None:
-                        return value
-        except Exception:
-            pass
-
-        return None
-
-    # 1) Flat Streamlit secrets, e.g. MYSQL_HOST = "..."
-    value = _lookup(st.secrets, key)
-    if value is not None:
-        return value
-
-    # 2) Grouped MySQL secrets, e.g.
-    #    [mysql]
-    #    host = "..."
-    #    port = "26325"
-    if key.startswith("MYSQL_"):
-        try:
-            mysql_section = _lookup(st.secrets, "mysql")
-            if mysql_section is not None:
-                short_key = key[6:].lower()
-                value = _lookup(mysql_section, short_key)
-                if value is not None:
-                    return value
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     return default
 
@@ -145,63 +110,18 @@ for _mysql_key, _mysql_variable in (
             _get_secret_value(_mysql_key)
         )
 
-# Optional provider connection URI support. Individual MYSQL_* values remain
-# preferred, but this fallback prevents deployment failures when a cloud
-# provider exposes only one connection string secret.
-if not all([mysql_host, mysql_database, mysql_user, mysql_password]):
-    _mysql_uri = _clean_config_value(os.getenv("MYSQL_URL"))
-    if not _mysql_uri:
-        _mysql_uri = _clean_config_value(_get_secret_value("MYSQL_URL"))
-    if _mysql_uri:
-        try:
-            _parsed_mysql_uri = urlparse(_mysql_uri)
-            if _parsed_mysql_uri.hostname and not mysql_host:
-                mysql_host = _clean_config_value(_parsed_mysql_uri.hostname)
-            if _parsed_mysql_uri.port and (not mysql_port or mysql_port == "3306"):
-                mysql_port = str(_parsed_mysql_uri.port)
-            if _parsed_mysql_uri.username and not mysql_user:
-                mysql_user = _clean_config_value(_parsed_mysql_uri.username)
-            if _parsed_mysql_uri.password and not mysql_password:
-                mysql_password = _clean_config_value(_parsed_mysql_uri.password)
-            if _parsed_mysql_uri.path and not mysql_database:
-                mysql_database = _clean_config_value(
-                    _parsed_mysql_uri.path.lstrip("/").split("/", 1)[0]
-                )
-        except Exception:
-            pass
-
 # Aiven requires an encrypted MySQL connection. These optional settings also
 # allow a CA certificate to be supplied later without changing application code.
 mysql_ssl_ca = _clean_config_value(os.getenv("MYSQL_SSL_CA"))
+mysql_ssl_verify_cert = _clean_config_value(
+    os.getenv("MYSQL_SSL_VERIFY_CERT"), "false"
+).lower() in {"1", "true", "yes", "on"}
+mysql_ssl_verify_identity = _clean_config_value(
+    os.getenv("MYSQL_SSL_VERIFY_IDENTITY"), "false"
+).lower() in {"1", "true", "yes", "on"}
+
 if not mysql_ssl_ca:
     mysql_ssl_ca = _clean_config_value(_get_secret_value("MYSQL_SSL_CA"))
-
-_ssl_verify_cert_env = _clean_config_value(os.getenv("MYSQL_SSL_VERIFY_CERT"))
-_ssl_verify_cert_secret = _clean_config_value(
-    _get_secret_value("MYSQL_SSL_VERIFY_CERT")
-)
-_ssl_verify_cert_value = (
-    _ssl_verify_cert_env
-    if _ssl_verify_cert_env is not None
-    else (_ssl_verify_cert_secret if _ssl_verify_cert_secret is not None else "false")
-)
-_ssl_verify_cert_explicit = (
-    _ssl_verify_cert_env is not None or _ssl_verify_cert_secret is not None
-)
-mysql_ssl_verify_cert = str(_ssl_verify_cert_value).lower() in {
-    "1", "true", "yes", "on"
-}
-
-_ssl_verify_identity_value = _clean_config_value(
-    os.getenv("MYSQL_SSL_VERIFY_IDENTITY")
-)
-if _ssl_verify_identity_value is None:
-    _ssl_verify_identity_value = _clean_config_value(
-        _get_secret_value("MYSQL_SSL_VERIFY_IDENTITY"), "false"
-    )
-mysql_ssl_verify_identity = str(_ssl_verify_identity_value).lower() in {
-    "1", "true", "yes", "on"
-}
 
 if not groq_api_key:
     st.error(
@@ -1175,9 +1095,7 @@ def get_mysql_connection():
             connection_options["ssl_ca"] = str(mysql_ssl_ca).strip()
             # When a CA is explicitly supplied, certificate verification is
             # enabled unless the user deliberately disabled it in config.
-            if not _ssl_verify_cert_explicit:
-                # If a CA is supplied and the user did not explicitly choose a
-                # verification setting, verify the server certificate.
+            if "MYSQL_SSL_VERIFY_CERT" not in os.environ:
                 connection_options["ssl_verify_cert"] = True
 
         connection = mysql.connector.connect(**connection_options)
@@ -3392,9 +3310,6 @@ else:
     # ---------------------------------------------------------
     # QUICK QUESTIONS
     # ---------------------------------------------------------
-    # Native Streamlit code blocks provide a built-in copy icon.
-    # This keeps the UI HTML/CSS-free while allowing the user to
-    # copy a complete question with one click.
     st.markdown("### 💡 Try these questions")
 
     quick_questions = [
@@ -3445,25 +3360,6 @@ def render_source_links(rag_sources=None, web_sources=None):
 
 
 # =========================================================
-# COPY ANSWER ICON
-# =========================================================
-
-def render_copy_answer_icon(content, key_suffix):
-    """
-    Compact native Streamlit copy control.
-
-    Streamlit's native st.code widget provides the actual clipboard-copy icon.
-    We keep that code block inside a small popover so the normal chat UI shows
-    only one compact copy icon instead of a large "Copy answer" section.
-    """
-    with st.popover("⧉", help="Copy answer"):
-        st.code(
-            content,
-            language="markdown",
-        )
-
-
-# =========================================================
 # RENDER EXISTING CHAT
 # =========================================================
 
@@ -3478,9 +3374,6 @@ for message in st.session_state.messages:
 
             st.write(message["content"])
 
-            if message.get("image_attached"):
-                st.caption("🖼️ Image attached")
-
     else:
 
         with st.chat_message(
@@ -3491,11 +3384,7 @@ for message in st.session_state.messages:
             st.markdown(message["content"])
 
             if message.get("generated_image"):
-                st.image(
-                    message["generated_image"],
-                    caption="Generated image",
-                    use_container_width=False,
-                )
+                st.image(message["generated_image"], caption="Generated image", use_container_width=False)
                 st.download_button(
                     "⬇️ Download image",
                     data=message["generated_image"],
@@ -3509,10 +3398,12 @@ for message in st.session_state.messages:
                 message.get("web_sources", []),
             )
 
-            render_copy_answer_icon(
-                message["content"],
-                f"history_{id(message)}",
-            )
+            # --- BUG FIX: Updated to small Copy Icon Popover ---
+            with st.popover("📋", help="Copy answer"):
+                st.code(
+                    message["content"],
+                    language="markdown",
+                )
 
 
 # =========================================================
@@ -3524,66 +3415,63 @@ if st.session_state.user_profile is None:
         "🔐 Login with your Name + Date of Birth to save and restore chat history."
     )
 
-# Current Streamlit supports file attachments directly inside st.chat_input.
-# This gives the composer a native attachment button instead of a large
-# file-uploader panel. On phones, tapping the attachment button opens the
-# device's file/image picker; on desktop, the same control opens the file
-# picker. The submission and its files are returned together in one object,
-# so an old attachment cannot silently leak into a later text-only question.
-#
-# We intentionally use the native Streamlit widget: no HTML/CSS/JavaScript.
+if st.session_state.uploaded_images:
+    st.caption(
+        f"📎 {len(st.session_state.uploaded_images)} image(s) currently attached. "
+        f"Maximum {MAX_IMAGES_PER_REQUEST} images per request."
+    )
 
-chat_submission = st.chat_input(
-    "💬 Ask Adarsh AI anything...",
-    key="adarsh_chat_input",
-    accept_file="multiple",
-    file_type=["png", "jpg", "jpeg", "webp"],
-    max_upload_size=20,
-)
+uploader_key = f"image_uploader_{st.session_state.image_uploader_version}"
+
+# --- BUG FIX: Chhota "+" Icon wala uploader (Paste support ke saath) ---
+with st.popover("➕ Attach Image", help="Click to select from gallery or Paste an image here"):
+    uploaded_files = st.file_uploader(
+        "Upload or Paste Image(s)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key=uploader_key,
+        label_visibility="collapsed"
+    )
+    
+    if uploaded_files:
+        if st.button("🗑️ Clear Attachment", key=f"clear_attachment_{st.session_state.image_uploader_version}", use_container_width=True):
+            st.session_state.uploaded_images = []
+            st.session_state.image_uploader_version += 1
+            st.rerun()
 
 submitted_images = []
 
-if chat_submission is not None:
-
-    user_message = (
-        getattr(chat_submission, "text", "")
-        or ""
-    ).strip()
-
-    submitted_files = list(
-        getattr(chat_submission, "files", [])
-        or []
-    )
-
-    if len(submitted_files) > MAX_IMAGES_PER_REQUEST:
+if uploaded_files:
+    if len(uploaded_files) > MAX_IMAGES_PER_REQUEST:
         st.error(
             f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message."
         )
-        submitted_files = submitted_files[:MAX_IMAGES_PER_REQUEST]
+    else:
+        for uploaded_file in uploaded_files:
+            image_bytes = uploaded_file.getvalue()
 
-    for uploaded_file in submitted_files:
+            if len(image_bytes) > MAX_IMAGE_SIZE_BYTES:
+                st.error(
+                    f"❌ {uploaded_file.name} is larger than 20 MB. "
+                    "Please choose a smaller screenshot/image."
+                )
+                continue
 
-        image_bytes = uploaded_file.getvalue()
-
-        if len(image_bytes) > MAX_IMAGE_SIZE_BYTES:
-            st.error(
-                f"❌ {uploaded_file.name} is larger than 20 MB. "
-                "Please choose a smaller screenshot/image."
+            submitted_images.append(
+                {
+                    "bytes": image_bytes,
+                    "mime": uploaded_file.type or "image/jpeg",
+                    "name": uploaded_file.name,
+                }
             )
-            continue
 
-        submitted_images.append(
-            {
-                "bytes": image_bytes,
-                "mime": uploaded_file.type or "image/jpeg",
-                "name": uploaded_file.name,
-            }
-        )
+# Normal text chat input
+user_message = st.chat_input(
+    "💬 Ask Adarsh AI anything...",
+    key="adarsh_chat_input",
+)
 
-else:
-    user_message = ""
-    submitted_files = []
-
+user_message = (user_message or "").strip()
 
 # =========================================================
 # PROCESS NEW QUESTION
@@ -3600,64 +3488,37 @@ if user_message or submitted_images:
             "corrected code when enough context is visible."
         )
 
-    # -----------------------------------------------------
-    # IMPORTANT UI FIX:
-    # Render the user's submitted question IMMEDIATELY.
-    #
-    # Previously the question was only appended to session_state and the
-    # assistant response was rendered during the same run. Because the normal
-    # message loop had already executed earlier, the submitted question did not
-    # appear until the NEXT rerun. This made it look as if the question vanished.
-    #
-    # We now render:
-    #     USER QUESTION
-    #          ↓
-    #     LOADING / THINKING
-    #          ↓
-    #     AI ANSWER
-    # -----------------------------------------------------
+    if current_images:
+        st.session_state.uploaded_images = []
+        st.session_state.image_uploader_version += 1
 
     st.session_state.messages.append(
         {
             "role": "user",
             "content": user_message,
-            "image_attached": bool(current_images),
         }
     )
 
-    with st.chat_message(
-        "user",
-        avatar="👤",
-    ):
-
-        st.write(user_message)
-
-        if current_images:
-            st.caption("🖼️ Image attached")
-
-    # Persistent MySQL chat flow: create a DB chat on the first message of a
-    # new conversation, then save the user's message before generating the reply.
     if st.session_state.mysql_user_id:
         active_chat = ensure_active_mysql_chat(user_message)
-
         if active_chat:
-
-            if not save_mysql_message(
-                active_chat,
-                "user",
-                user_message,
-            ):
+            if not save_mysql_message(active_chat, "user", user_message):
                 st.warning(
                     "⚠️ Your message is visible here, but MySQL could not save it. "
                     "Open Settings → Database status for details."
                 )
-
         else:
-
             st.warning(
                 "⚠️ MySQL chat storage is unavailable. The answer will still work, "
                 "but this message may not be saved."
             )
+
+    # --- BUG FIX: Immediate UI Render Taaki message hide na ho ---
+    with st.chat_message("user", avatar="👤"):
+        st.write(user_message)
+        if current_images:
+            st.caption(f"📎 Attached {len(current_images)} image(s)")
+    # -------------------------------------------------------------
 
     with st.chat_message(
         "assistant",
@@ -3741,7 +3602,6 @@ if user_message or submitted_images:
             )
 
             if st.session_state.mysql_user_id and st.session_state.active_chat_id:
-
                 if not save_mysql_message(
                     st.session_state.active_chat_id,
                     "assistant",
@@ -3752,7 +3612,6 @@ if user_message or submitted_images:
                     )
 
                 for chat in st.session_state.chat_history:
-
                     if chat["id"] == st.session_state.active_chat_id:
                         chat["messages"] = st.session_state.messages.copy()
                         break
@@ -3770,11 +3629,12 @@ if user_message or submitted_images:
                 web_sources,
             )
 
-            # Compact native copy icon only.
-            render_copy_answer_icon(
-                answer,
-                f"current_{len(st.session_state.messages)}",
-            )
+            # --- BUG FIX: Updated to small Copy Icon Popover ---
+            with st.popover("📋", help="Copy answer"):
+                st.code(
+                    answer,
+                    language="markdown",
+                )
 
         except Exception as error:
 
@@ -3800,14 +3660,11 @@ if user_message or submitted_images:
                         and "tokens" in error_text
                     )
                 ):
-
                     friendly_error = (
                         "⏳ The AI service token limit was reached. "
                         "Please wait a moment and retry."
                     )
-
                 else:
-
                     friendly_error = (
                         "⏳ The AI service is temporarily rate-limited. "
                         "Please wait a moment and retry."
@@ -3818,7 +3675,6 @@ if user_message or submitted_images:
                 or "max_completion_tokens" in error_text
                 or "output" in error_text
             ):
-
                 friendly_error = (
                     "⏳ The image-analysis request exceeded the available "
                     "output-token budget. The image attachment has been cleared; "
@@ -3851,16 +3707,11 @@ if user_message or submitted_images:
                 "🔎 Technical error details",
                 expanded=False,
             ):
-
                 st.code(
                     str(error),
                     language="text",
                 )
 
         finally:
-
-            # Keep the old attachment state completely empty so a future
-            # submission cannot accidentally reuse an earlier image.
             st.session_state.uploaded_images = []
             st.session_state.image_uploader_version += 1
-
