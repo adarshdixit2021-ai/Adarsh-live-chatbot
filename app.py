@@ -173,10 +173,17 @@ st.session_state.mysql_available = bool(
 
 SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 
-# Vision model used for image understanding and code debugging.
-VISION_MODEL = "qwen/qwen3.6-27b"
+# Vision models currently supported by Groq.
+# The app checks which candidates are accessible to the current API key and
+# automatically falls back if one model returns model_not_found.
+VISION_MODEL_CANDIDATES = (
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
+)
+VISION_MODEL = VISION_MODEL_CANDIDATES[0]
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
-MAX_IMAGES_PER_REQUEST = 5
+# Qwen 3.8 supports up to 3 images per request; Qwen 3.6 supports up to 5.
+MAX_IMAGES_PER_REQUEST = 3
 MAX_IMAGE_API_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_IMAGE_API_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_DISPLAY_WIDTH = 180
@@ -2576,46 +2583,112 @@ def prepare_image_for_vision(image_bytes, image_mime):
         ) from error
 
 
-def _call_vision_model(messages_for_ai):
-    """Call Groq vision with a safe output budget and one lower-budget retry."""
+@st.cache_resource(show_spinner=False)
+def _get_accessible_vision_models():
+    """
+    Discover which supported Groq vision models are actually available to
+    the current API key/project.
+    """
     try:
-        return client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=messages_for_ai,
-            max_completion_tokens=700,
-            reasoning_effort="none",
-            temperature=0.2,
-        )
-    except Exception as first_error:
-        error_text = str(first_error).lower()
+        model_page = client.models.list()
+        available_ids = {
+            str(getattr(model, "id", "")).strip()
+            for model in getattr(model_page, "data", [])
+        }
+        discovered = [
+            model_id
+            for model_id in VISION_MODEL_CANDIDATES
+            if model_id in available_ids
+        ]
+        if discovered:
+            return discovered
+    except Exception:
+        # If model listing is unavailable, try the known current candidates
+        # directly. The actual request remains the final authority.
+        pass
 
-        # Groq can enforce a very small output-tokens-per-minute budget on
-        # lower tiers. Retry once with an even smaller output ceiling when
-        # the first request is rejected specifically for OTPM.
-        is_otpm_limit = (
-            "429" in error_text
-            and (
-                "output tokens per minute" in error_text
-                or "otpm" in error_text
-                or (
-                    "requested" in error_text
-                    and "tokens" in error_text
+    return list(VISION_MODEL_CANDIDATES)
+
+
+def _is_model_not_found_error(error):
+    """Return True for Groq errors indicating the selected model is unavailable."""
+    error_text = str(error).lower()
+    return (
+        "model_not_found" in error_text
+        or "model not found" in error_text
+        or ("404" in error_text and "model" in error_text)
+        or "does not exist or you do not have access" in error_text
+    )
+
+
+def _call_vision_model(messages_for_ai):
+    """
+    Call Groq vision with automatic model fallback.
+
+    If one current vision model is unavailable for the API key/project,
+    the next supported model is tried automatically.
+    """
+    last_model_error = None
+    candidate_models = _get_accessible_vision_models()
+
+    for model_id in candidate_models:
+        try:
+            return client.chat.completions.create(
+                model=model_id,
+                messages=messages_for_ai,
+                max_completion_tokens=700,
+                reasoning_effort="none",
+                temperature=0.2,
+            )
+
+        except Exception as first_error:
+            error_text = str(first_error).lower()
+
+            # 404/model_not_found -> try the next current vision model.
+            if _is_model_not_found_error(first_error):
+                last_model_error = first_error
+                continue
+
+            # Groq can enforce an output-tokens-per-minute limit. Retry once
+            # with a smaller output budget for that specific condition.
+            is_otpm_limit = (
+                "429" in error_text
+                and (
+                    "output tokens per minute" in error_text
+                    or "otpm" in error_text
+                    or (
+                        "requested" in error_text
+                        and "tokens" in error_text
+                    )
                 )
             )
-        )
 
-        if not is_otpm_limit:
+            if is_otpm_limit:
+                time.sleep(0.8)
+                try:
+                    return client.chat.completions.create(
+                        model=model_id,
+                        messages=messages_for_ai,
+                        max_completion_tokens=450,
+                        reasoning_effort="none",
+                        temperature=0.2,
+                    )
+                except Exception as retry_error:
+                    if _is_model_not_found_error(retry_error):
+                        last_model_error = retry_error
+                        continue
+                    raise
+
             raise
 
-        time.sleep(0.8)
-
-        return client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=messages_for_ai,
-            max_completion_tokens=450,
-            reasoning_effort="none",
-            temperature=0.2,
-        )
+    raise RuntimeError(
+        "No supported Groq vision model is accessible with the current "
+        "GROQ_API_KEY/project. Groq currently lists Qwen 3.8 27B and Qwen "
+        "3.6 27B as vision-capable models, but this API key returned "
+        "model_not_found for the available candidates. Check that the "
+        "Streamlit Cloud GROQ_API_KEY is the correct active Groq key and "
+        "that the key/project has access to a vision model."
+    ) from last_model_error
 
 
 def get_image_chat_response(user_message, uploaded_images):
@@ -3669,6 +3742,19 @@ if user_message or submitted_images:
                         "⏳ The AI service is temporarily rate-limited. "
                         "Please wait a moment and retry."
                     )
+
+            elif has_image and (
+                "no supported groq vision model" in error_text
+                or "model_not_found" in error_text
+                or "model not found" in error_text
+                or "does not exist or you do not have access" in error_text
+            ):
+                friendly_error = (
+                    "🖼️ Groq image analysis is not available for the current API key. "
+                    "The app automatically tried the supported vision models, but "
+                    "this Groq project did not grant access to them. Please update "
+                    "the GROQ_API_KEY in Streamlit Cloud Secrets with an active key."
+                )
 
             elif has_image and (
                 "token" in error_text
