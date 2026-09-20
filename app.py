@@ -19,7 +19,6 @@ from google.oauth2.service_account import Credentials
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from PIL import Image
-from streamlit_chat_prompt import prompt as chat_prompt
 
 # =========================================================
 # STREAMLIT UI CONFIGURATION
@@ -3624,18 +3623,17 @@ for message in st.session_state.messages:
 # CHAT INPUT + IMAGE ATTACHMENTS
 # =========================================================
 #
-# Uses a dedicated chat-prompt component so images live INSIDE the
-# typing bar instead of appearing as a separate uploader above it.
+# Uses Streamlit's native chat_input with built-in file attachments.
+# Current Streamlit supports multiple file attachments in the chat input
+# and supports pasting files/images directly into st.chat_input.
 #
 # Supported:
-#   • + attachment button -> gallery/file picker
-#   • Ctrl+V / Cmd+V -> paste an image from the clipboard
-#   • up to 5 images per message
-#   • images remain attached while the user types
-#   • no vision request happens until the user explicitly sends a prompt
-#
-# The component is intentionally used here because native Streamlit
-# st.chat_input does not provide a documented clipboard-image paste API.
+#   • attachment button inside the typing bar
+#   • gallery/file picker on desktop and mobile
+#   • Ctrl+V / Cmd+V image paste from clipboard
+#   • up to 5 images per message (validated server-side)
+#   • image analysis starts ONLY after the user submits a text prompt
+#   • no separate uploader above the chat box
 # =========================================================
 
 if st.session_state.user_profile is None:
@@ -3643,12 +3641,12 @@ if st.session_state.user_profile is None:
         "🔐 Login with your Name + Date of Birth to save and restore chat history."
     )
 
-chat_submission = chat_prompt(
-    name="adarsh_ai_chat",
+chat_submission = st.chat_input(
+    "Ask Adarsh AI anything…",
     key="adarsh_ai_chat_prompt",
-    placeholder="Ask Adarsh AI anything…",
-    main_bottom=True,
-    max_image_size=MAX_IMAGE_SIZE_BYTES,
+    accept_file="multiple",
+    file_type=["png", "jpg", "jpeg", "webp"],
+    max_upload_size=20,
     disabled=False,
 )
 
@@ -3658,28 +3656,22 @@ submitted_images = []
 if chat_submission is not None:
     user_message = str(getattr(chat_submission, "text", "") or "").strip()
 
-    component_images = list(getattr(chat_submission, "images", []) or [])
+    uploaded_files = list(getattr(chat_submission, "files", []) or [])
 
-    if len(component_images) > MAX_IMAGES_PER_REQUEST:
+    # Hard server-side limit: never send more than five images.
+    if len(uploaded_files) > MAX_IMAGES_PER_REQUEST:
         st.error(
             f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message. "
-            "Please remove the extra images and send again."
+            f"You selected {len(uploaded_files)}. Please send up to {MAX_IMAGES_PER_REQUEST} images at a time."
         )
-        component_images = component_images[:MAX_IMAGES_PER_REQUEST]
+        uploaded_files = uploaded_files[:MAX_IMAGES_PER_REQUEST]
         user_message = ""
 
-    for index, image in enumerate(component_images, start=1):
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
         try:
-            image_data = str(getattr(image, "data", "") or "")
-            image_type = str(
-                getattr(image, "type", "") or "image/png"
-            ).strip()
-
-            if not image_data:
-                continue
-
-            # streamlit-chat-prompt returns base64 image data.
-            image_bytes = base64.b64decode(image_data, validate=True)
+            image_bytes = uploaded_file.getvalue()
+            image_type = str(getattr(uploaded_file, "type", "") or "image/png").strip()
+            image_name = str(getattr(uploaded_file, "name", "") or f"image_{index}.png")
 
             if not image_bytes:
                 continue
@@ -3695,23 +3687,22 @@ if chat_submission is not None:
                 {
                     "bytes": image_bytes,
                     "mime": image_type,
-                    "name": f"pasted_or_attached_image_{index}.png",
+                    "name": image_name,
                 }
             )
 
-        except Exception as image_error:
+        except Exception:
             st.warning(
                 f"⚠️ Image {index} could not be read. "
                 "Please attach or paste it again."
             )
 
-    # Images are allowed only as part of an explicit user question.
-    # This prevents accidental analysis when the user merely attaches
-    # an image and has not asked anything yet.
+    # An image-only submission must not trigger vision analysis. The user
+    # must explicitly provide a question/prompt first.
     if submitted_images and not user_message:
         st.warning(
-            "🖼️ Your image(s) are attached. Please type your question "
-            "before sending, for example: “What is causing this error?”"
+            "🖼️ Your image(s) were received, but I need your question first. "
+            "For example: “What is causing this error?”"
         )
         submitted_images = []
 
