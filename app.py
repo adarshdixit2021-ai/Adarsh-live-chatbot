@@ -3433,113 +3433,122 @@ if st.session_state.user_profile:
 
     if not st.session_state.messages:
 
-        st.markdown(
-            f"# 🤖 Hi {name}!"
-        )
+        st.markdown(f"# 🤖 Hi {name}!")
+        st.caption("Your Personal AI Assistant")
 
         st.markdown(
-            "### Your Personal AI Assistant"
-        )
-
-        st.caption(
-            "Ask a question and get a clear, organized answer."
+            "Ask anything, learn step-by-step, solve coding problems, "
+            "or get help with current information."
         )
 
         st.divider()
+
+        # -------------------------------------------------
+        # WELCOME / CAPABILITY CARDS
+        # -------------------------------------------------
 
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.info(
-                "**📚 Learn**\n\n"
-                "Simple definitions, key points and examples."
-            )
+            with st.container(border=True):
+                st.markdown("### 📚 Learn")
+                st.caption(
+                    "Understand concepts in simple language with "
+                    "examples and step-by-step explanations."
+                )
 
         with col2:
-            st.info(
-                "**💻 Code**\n\n"
-                "Simple solutions with useful explanations."
-            )
+            with st.container(border=True):
+                st.markdown("### 💻 Build")
+                st.caption(
+                    "Get help with Java, Python, React, SQL, "
+                    "Spring Boot and other technical problems."
+                )
 
         with col3:
-            st.info(
-                "**🌐 Current Info**\n\n"
-                "Search current information when needed."
-            )
+            with st.container(border=True):
+                st.markdown("### 🖼️ Analyze")
+                st.caption(
+                    "Attach up to 5 images and ask a specific "
+                    "question about what you want to understand."
+                )
 
         st.divider()
 
-        st.markdown("### 💡 Try asking")
+        with st.container(border=True):
+            st.markdown("### ✨ Ready when you are")
+            st.caption(
+                "Type your question below. You can also attach images "
+                "when your question depends on visual information."
+            )
 
-        st.write(
-            "• What is inheritance in Java?"
-        )
-        st.write(
-            "• Explain matrices for 4 marks."
-        )
-        st.write(
-            "• Write a simple Python program to reverse a string."
+        st.caption(
+            "🔒 Your saved chats are available from the sidebar when you are logged in."
         )
 
     else:
 
-        st.markdown(
-            "# 🤖 Adarsh AI"
-        )
-
+        st.markdown("# 🤖 Adarsh AI")
         st.caption(
-            "Clear answers. Simple explanations. No unnecessary information."
+            "Clear answers • Simple explanations • Focused assistance"
         )
 
 else:
 
     st.markdown("# 🤖 Adarsh AI")
+    st.caption("Your Personal AI Assistant")
 
     st.markdown(
-        "### Your Personal AI Assistant"
-    )
-
-    st.caption(
-        "Ask questions • Learn • Explore • Get answers"
+        "Learn, build, solve problems and explore ideas with clear, "
+        "organized answers."
     )
 
     st.divider()
 
-    st.markdown(
-        "## 👋 Welcome"
-    )
+    with st.container(border=True):
+        st.markdown("### 👋 Welcome to Adarsh AI")
+        st.write(
+            "Ask about programming, mathematics, technology, "
+            "Artificial Intelligence, Data Science or everyday questions."
+        )
 
-    st.write(
-        "Ask me about programming, mathematics, technology, "
-        "Artificial Intelligence, Data Science or everyday questions."
-    )
+        st.caption(
+            "You can also attach up to 5 images and ask a question "
+            "about the information you need from them."
+        )
+
+    st.write("")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with st.container(border=True):
+            st.markdown("### 🧠 Understand")
+            st.caption(
+                "Get beginner-friendly explanations, examples and "
+                "step-by-step guidance."
+            )
+
+    with col2:
+        with st.container(border=True):
+            st.markdown("### 🛠️ Create")
+            st.caption(
+                "Work through code, debugging, SQL, React, Java, "
+                "Spring Boot and technical questions."
+            )
+
+    st.write("")
+
+    with st.container(border=True):
+        st.markdown("### 🔐 Save your conversations")
+        st.caption(
+            "Create an account from the sidebar using your Name, "
+            "Date of Birth and Gender to save and restore chat history."
+        )
 
     st.info(
-        "👤 Create a profile from the sidebar if you want "
-        "a personalized experience."
+        "💬 Start by typing your question in the message box below."
     )
-
-    # ---------------------------------------------------------
-    # QUICK QUESTIONS
-    # ---------------------------------------------------------
-    st.markdown("### 💡 Try these questions")
-
-    quick_questions = [
-        "Explain Java in simple words with a real-world example.",
-        "What is the difference between JDK, JRE and JVM?",
-        "Explain Spring Boot and why we use it.",
-        "What is React and how does the Virtual DOM work?",
-        "Explain SQL JOINs with simple examples.",
-        "What is Generative AI and how does it work?",
-    ]
-
-    question_columns = st.columns(2)
-
-    for index, question in enumerate(quick_questions):
-        with question_columns[index % 2]:
-            st.code(question, language="text")
-
-    st.caption("📋 Click the copy icon on any question to copy it in one click.")
 
 
 # =========================================================
@@ -3629,14 +3638,14 @@ if st.session_state.user_profile is None:
 
 if st.session_state.uploaded_images:
     st.caption(
-        f"📎 {len(st.session_state.uploaded_images)} image(s) currently attached. "
+        f"📎 {len(st.session_state.uploaded_images)} image(s) attached. "
         f"Maximum {MAX_IMAGES_PER_REQUEST} images per message."
     )
 
 uploader_key = f"image_uploader_{st.session_state.image_uploader_version}"
 
 # --- BUG FIX: Chhota "+" Icon wala uploader (Paste support ke saath) ---
-with st.popover("➕ Attach Image", help="Select up to 5 images. Uploading waits for your question."):
+with st.popover("➕", help="Attach up to 5 images. Analysis starts only after you send a question."):
     uploaded_files = st.file_uploader(
         "Upload up to 5 Image(s)",
         type=["png", "jpg", "jpeg", "webp"],
