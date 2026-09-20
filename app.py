@@ -49,32 +49,79 @@ st.set_page_config(
 
 load_dotenv()
 
-groq_api_key = os.getenv("GROQ_API_KEY")
-google_sheet_id = os.getenv("GOOGLE_SHEET_ID")
-mysql_host = os.getenv("MYSQL_HOST")
-mysql_port = os.getenv("MYSQL_PORT", "3306")
-mysql_database = os.getenv("MYSQL_DATABASE")
-mysql_user = os.getenv("MYSQL_USER")
-mysql_password = os.getenv("MYSQL_PASSWORD")
 
-if not groq_api_key:
+def _clean_config_value(value, default=None):
+    """Return a stripped configuration value, treating blank strings as missing."""
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value if value else default
+
+
+def _get_secret_value(key, default=None):
+    """Read a Streamlit secret safely, supporting both flat and grouped secrets."""
     try:
-        groq_api_key = st.secrets["GROQ_API_KEY"]
+        value = st.secrets.get(key)
+        if value is not None:
+            return value
     except Exception:
-        groq_api_key = None
+        pass
+
+    # Also support an optional [mysql] section in Streamlit Secrets.
+    try:
+        mysql_section = st.secrets.get("mysql")
+        if mysql_section and key.startswith("MYSQL_"):
+            short_key = key[6:].lower()
+            value = mysql_section.get(short_key)
+            if value is not None:
+                return value
+    except Exception:
+        pass
+
+    return default
+
+
+groq_api_key = _clean_config_value(os.getenv("GROQ_API_KEY"))
+google_sheet_id = _clean_config_value(os.getenv("GOOGLE_SHEET_ID"))
+
+# Local development uses .env. Streamlit Cloud uses st.secrets.
+# Environment variables take priority when they contain a real value.
+if not groq_api_key:
+    groq_api_key = _clean_config_value(_get_secret_value("GROQ_API_KEY"))
 
 if not google_sheet_id:
-    try:
-        google_sheet_id = st.secrets["GOOGLE_SHEET_ID"]
-    except Exception:
-        google_sheet_id = None
+    google_sheet_id = _clean_config_value(_get_secret_value("GOOGLE_SHEET_ID"))
 
-for _mysql_key in ["MYSQL_HOST", "MYSQL_PORT", "MYSQL_DATABASE", "MYSQL_USER", "MYSQL_PASSWORD"]:
-    if not globals().get("mysql_" + _mysql_key.lower().replace("mysql_", "")):
-        try:
-            globals()["mysql_" + _mysql_key.lower().replace("mysql_", "")] = st.secrets[_mysql_key]
-        except Exception:
-            pass
+mysql_host = _clean_config_value(os.getenv("MYSQL_HOST"))
+mysql_port = _clean_config_value(os.getenv("MYSQL_PORT"), "3306")
+mysql_database = _clean_config_value(os.getenv("MYSQL_DATABASE"))
+mysql_user = _clean_config_value(os.getenv("MYSQL_USER"))
+mysql_password = _clean_config_value(os.getenv("MYSQL_PASSWORD"))
+
+for _mysql_key, _mysql_variable in (
+    ("MYSQL_HOST", "mysql_host"),
+    ("MYSQL_PORT", "mysql_port"),
+    ("MYSQL_DATABASE", "mysql_database"),
+    ("MYSQL_USER", "mysql_user"),
+    ("MYSQL_PASSWORD", "mysql_password"),
+):
+    if not globals().get(_mysql_variable):
+        globals()[_mysql_variable] = _clean_config_value(
+            _get_secret_value(_mysql_key)
+        )
+
+# Aiven requires an encrypted MySQL connection. These optional settings also
+# allow a CA certificate to be supplied later without changing application code.
+mysql_ssl_ca = _clean_config_value(os.getenv("MYSQL_SSL_CA"))
+mysql_ssl_verify_cert = _clean_config_value(
+    os.getenv("MYSQL_SSL_VERIFY_CERT"), "false"
+).lower() in {"1", "true", "yes", "on"}
+mysql_ssl_verify_identity = _clean_config_value(
+    os.getenv("MYSQL_SSL_VERIFY_IDENTITY"), "false"
+).lower() in {"1", "true", "yes", "on"}
+
+if not mysql_ssl_ca:
+    mysql_ssl_ca = _clean_config_value(_get_secret_value("MYSQL_SSL_CA"))
 
 if not groq_api_key:
     st.error(
@@ -1008,10 +1055,11 @@ def _set_mysql_error(error):
         if secret:
             message = message.replace(str(secret), "***")
     st.session_state.mysql_last_error = message[:2000]
+    st.session_state.mysql_available = False
 
 
 def get_mysql_connection():
-    """Create a fresh MySQL connection and retain a safe diagnostic on failure."""
+    """Create a fresh MySQL connection for local MySQL or a cloud provider such as Aiven."""
     if not all([mysql_host, mysql_port, mysql_database, mysql_user, mysql_password]):
         _set_mysql_error(
             "MySQL configuration is incomplete. Required: MYSQL_HOST, "
@@ -1020,16 +1068,39 @@ def get_mysql_connection():
         return None
 
     try:
-        connection = mysql.connector.connect(
-            host=str(mysql_host).strip(),
-            port=int(mysql_port),
-            database=str(mysql_database).strip(),
-            user=str(mysql_user).strip(),
-            password=str(mysql_password),
-            connection_timeout=5,
-            autocommit=False,
-        )
+        port = int(str(mysql_port).strip())
+        if not 1 <= port <= 65535:
+            raise ValueError("MYSQL_PORT must be between 1 and 65535.")
+    except (TypeError, ValueError) as error:
+        _set_mysql_error(f"Invalid MySQL port: {error}")
+        return None
+
+    try:
+        connection_options = {
+            "host": str(mysql_host).strip(),
+            "port": port,
+            "database": str(mysql_database).strip(),
+            "user": str(mysql_user).strip(),
+            "password": str(mysql_password),
+            "connection_timeout": 10,
+            "autocommit": False,
+            # Aiven requires TLS. For normal Aiven connections the connector
+            # negotiates TLS without requiring a locally downloaded CA file.
+            "ssl_disabled": False,
+            "ssl_verify_cert": mysql_ssl_verify_cert,
+            "ssl_verify_identity": mysql_ssl_verify_identity,
+        }
+
+        if mysql_ssl_ca:
+            connection_options["ssl_ca"] = str(mysql_ssl_ca).strip()
+            # When a CA is explicitly supplied, certificate verification is
+            # enabled unless the user deliberately disabled it in config.
+            if "MYSQL_SSL_VERIFY_CERT" not in os.environ:
+                connection_options["ssl_verify_cert"] = True
+
+        connection = mysql.connector.connect(**connection_options)
         st.session_state.mysql_last_error = ""
+        st.session_state.mysql_available = True
         return connection
     except Exception as error:
         _set_mysql_error(f"MySQL connection failed: {error}")
@@ -1123,6 +1194,8 @@ def ensure_mysql_schema():
             )
 
         connection.commit()
+        st.session_state.mysql_available = True
+        st.session_state.mysql_last_error = ""
         return True
 
     except Exception as error:
@@ -3041,7 +3114,9 @@ with st.sidebar:
         )
 
         with st.expander("🗄️ Database status", expanded=False):
-            configured = bool(mysql_host and mysql_database and mysql_user and mysql_password)
+            configured = bool(
+                mysql_host and mysql_port and mysql_database and mysql_user and mysql_password
+            )
             st.write(
                 f"**Configured:** {'Yes' if configured else 'No'}"
             )
