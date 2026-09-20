@@ -177,13 +177,16 @@ SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 # The app checks which candidates are accessible to the current API key and
 # automatically falls back if one model returns model_not_found.
 VISION_MODEL_CANDIDATES = (
-    "qwen/qwen3.8-27b",
+    # Qwen 3.6 supports up to 5 images in one request. If it is not
+    # accessible, the app falls back to Qwen 3.8 and batches 4-5 images.
     "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b",
 )
 VISION_MODEL = VISION_MODEL_CANDIDATES[0]
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
-# Qwen 3.8 supports up to 3 images per request; Qwen 3.6 supports up to 5.
-MAX_IMAGES_PER_REQUEST = 3
+# User can attach at most five images to one message.
+MAX_IMAGES_PER_REQUEST = 5
+# A single 3-image fallback batch stays below the safe API payload budget.
 MAX_IMAGE_API_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_IMAGE_API_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_DISPLAY_WIDTH = 180
@@ -2691,90 +2694,69 @@ def _call_vision_model(messages_for_ai):
     ) from last_model_error
 
 
-def get_image_chat_response(user_message, uploaded_images):
-    """Analyze up to five uploaded images with Groq's Qwen vision model, with special handling for code debugging."""
-
-    user_message = str(user_message).strip()[:4000]
-
-    if not uploaded_images:
-        raise ValueError("No image was uploaded.")
-
-    if len(uploaded_images) > MAX_IMAGES_PER_REQUEST:
-        raise ValueError(f"A maximum of {MAX_IMAGES_PER_REQUEST} images can be analyzed at once.")
-
-    # Keep previous text context for follow-up questions, but do not resend
-    # old image payloads. The current images are attached below every turn.
-    recent_messages = st.session_state.messages[:-1][-6:]
-    bounded_messages = []
-
-    for message in recent_messages:
-        role = message.get("role")
-        if role not in ("user", "assistant"):
-            continue
-        content = str(message.get("content", ""))[:1500]
-        if content:
-            bounded_messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                }
-            )
-
-    rag_topic = detect_rag_topic(user_message)
-    rag_context = ""
-    rag_sources = []
-
-    if rag_topic:
-        rag_context, rag_sources = retrieve_trusted_context(
-            user_message,
-            rag_topic,
-            top_k=3,
-        )
-        st.session_state.last_rag_topic = rag_topic
-        st.session_state.last_rag_sources = rag_sources
-    else:
-        st.session_state.last_rag_topic = None
-        st.session_state.last_rag_sources = []
-
+def _build_vision_messages(user_message, image_infos, rag_context, rag_topic, bounded_messages, evidence_only=False):
+    """Build one Groq vision request for the supplied image batch."""
     vision_rules = """
 IMAGE / CODE DEBUGGING MODE
 
 You are Adarsh AI's visual analysis and code-debugging assistant.
-You can analyze and explain uploaded images, but this application does NOT provide an image-generation or pixel-level image-editing API.
-Never claim that an edited/generated image was actually created. If the user asks for an image edit, explain the requested edit clearly and say that Adarsh AI can analyze the image and provide editing instructions, but cannot render the edited image in this app.
+The user has explicitly asked a question about the uploaded image(s).
+Your first responsibility is to answer THAT question from the visible image evidence.
+Do not start with a generic description of the image and do not discuss unrelated
+visible objects, people, text, buttons, dates, or UI elements unless they help answer
+the user's question.
 
-The uploaded image(s) may contain a programming code screenshot, terminal/compiler error, stack trace, SQL query, IDE screen, document, diagram, table, or ordinary photo.
+STRICT VISUAL GROUNDING
+1. Use only what is actually visible/readable in the uploaded image(s).
+2. Never invent text, numbers, errors, people, objects, or details that are not visible.
+3. If something is blurry, cropped, hidden, or unreadable, say so.
+4. If multiple images are supplied, compare/correlate them when relevant and refer to
+   them as Image 1, Image 2, Image 3, Image 4, and Image 5.
+5. Ignore irrelevant visual information. If the user asks about an error, focus on the
+   error and evidence needed to explain/fix it; do not describe unrelated UI.
 
-GENERAL IMAGE RULES
-1. Answer the user's exact question.
-2. Describe only information that is actually visible.
-3. Never invent text, numbers, errors, people, objects, or details that are not readable/visible.
-4. If something is blurry, cropped, hidden, or unreadable, explicitly say so.
-5. If multiple images are supplied, analyze all of them and refer to them as Image 1, Image 2, Image 3, Image 4, and Image 5 as applicable.
+RESPONSE ORDER
+Always follow this order:
+### Answer to Your Question
+Give the direct answer first. Answer exactly what the user asked, using the uploaded
+image(s) as the evidence.
+
+### Image Summary
+After the answer, give a short summary of the visible evidence that is relevant to
+the user's question. Do NOT turn this into a general image-description dump. Mention
+only the visible details that support, clarify, or qualify the answer.
 
 CODE DEBUGGING RULES
-When the image contains source code, compiler output, terminal output, stack traces, logs, SQL, configuration, or an IDE:
-1. Identify the programming language when possible.
-2. Read the visible error message exactly and distinguish errors from warnings.
-3. Locate the problematic line or section when visible.
+When the image contains source code, compiler output, terminal output, stack traces,
+logs, SQL, configuration, or an IDE:
+1. Identify the language when possible.
+2. Read visible error messages accurately and distinguish errors from warnings.
+3. Locate the problematic line/section when visible.
 4. Explain the root cause in simple language.
 5. Preserve the user's intended logic; do not unnecessarily rewrite working code.
-6. Reconstruct COMPLETE corrected code when enough code is visible. Include required imports and preserve class/file structure when visible.
-7. Check syntax, brackets, quotes, variable names, types, method signatures, imports, and obvious compile/runtime issues before presenting the correction.
-8. If multiple screenshots contain related code/error output, correlate them before deciding the fix.
-9. Never claim the code was executed or verified unless you actually executed it.
-10. If the screenshot does not contain enough code/context to safely produce a complete correction, clearly state what is missing and provide the safest targeted fix instead of inventing missing code.
-11. If the user asks for “error-free code”, provide the best corrected complete code possible and clearly say it should be run/tested in their environment; do not falsely guarantee execution.
+6. Reconstruct complete corrected code when enough code is visible.
+7. Check syntax, brackets, quotes, variable names, types, method signatures, imports,
+   and obvious compile/runtime issues before presenting a correction.
+8. If multiple screenshots contain related code/error output, correlate them before
+   deciding the fix.
+9. Never claim the code was executed or verified unless it was actually executed.
+10. If the screenshot lacks enough context for a safe complete correction, say what is
+    missing instead of inventing it.
+11. If the user asks for error-free code, provide the best correction possible and say
+    it should be run/tested in their environment; do not falsely guarantee execution.
 
-PREFERRED CODE-DEBUGGING RESPONSE FORMAT
-### Error Found
-### Root Cause
-### Corrected Complete Code
-### What Was Changed
-### Why This Fix Works
-### How to Run/Test
+If the image is not a code/debugging screenshot, answer naturally and only discuss what
+is relevant to the user's question.
+"""
 
-If the image is not a code/debugging screenshot, do not force the code format. Answer naturally based on what is visible.
+    if evidence_only:
+        vision_rules += """
+
+BATCH EVIDENCE MODE
+This is an internal evidence pass because the user uploaded more images than one
+vision request can safely contain. Do NOT give a generic image description.
+Extract only the visual facts/evidence needed to answer the user's exact question.
+Keep the evidence concise and label image numbers where useful. Do not speculate.
 """
 
     messages_for_ai = [
@@ -2795,7 +2777,7 @@ If the image is not a code/debugging screenshot, do not force the code format. A
     total_prepared_bytes = 0
     prepared_count = 0
 
-    for index, image_info in enumerate(uploaded_images[:MAX_IMAGES_PER_REQUEST], start=1):
+    for index, image_info in image_infos:
         image_bytes = image_info["bytes"]
         image_mime = image_info["mime"] or "image/jpeg"
         image_name = image_info["name"]
@@ -2812,8 +2794,8 @@ If the image is not a code/debugging screenshot, do not force the code format. A
 
         if total_prepared_bytes + len(prepared_bytes) > MAX_TOTAL_IMAGE_API_BYTES:
             raise ValueError(
-                "The combined image payload is too large for a safe request. "
-                "Please upload smaller images or fewer images."
+                "The combined image payload for this analysis batch is too large. "
+                "Please upload smaller images."
             )
 
         total_prepared_bytes += len(prepared_bytes)
@@ -2846,26 +2828,183 @@ If the image is not a code/debugging screenshot, do not force the code format. A
             "content": multimodal_content,
         }
     )
+    return messages_for_ai
 
-    try:
-        response = _call_vision_model(messages_for_ai)
-    except Exception as error:
-        # Preserve the real API error so the UI can distinguish authentication,
-        # payload, model, rate-limit, and connectivity failures.
-        raise RuntimeError(f"Groq vision request failed: {error}") from error
 
-    answer = response.choices[0].message.content or ""
-    if not answer.strip():
-        raise RuntimeError(
-            "Groq vision returned an empty response. Please retry the image request."
+def _is_image_count_limit_error(error):
+    """Detect a vision-model error caused by too many images in one request."""
+    text = str(error).lower()
+    return (
+        "maximum" in text and "image" in text
+        or "max" in text and "image" in text
+        or "too many images" in text
+        or "3 images" in text
+        or "image limit" in text
+    )
+
+
+def _synthesize_multi_batch_image_answer(user_message, evidence_parts):
+    """Turn multiple vision evidence passes into one focused user-facing answer."""
+    evidence_text = "\n\n".join(evidence_parts)
+    synthesis_prompt = f"""
+You are answering a user's question using evidence extracted from up to five uploaded images.
+
+USER QUESTION:
+{user_message[:4000]}
+
+VISUAL EVIDENCE FROM THE UPLOADED IMAGES:
+{evidence_text[:12000]}
+
+Rules:
+1. Answer the user's exact question first.
+2. Use only the supplied visual evidence; do not invent or add unrelated facts.
+3. If evidence is uncertain, say so.
+4. Do not discuss visual details that are irrelevant to the question.
+5. If the question is about code/error/debugging, explain the root cause and give the
+   corrected code only when the evidence is sufficient.
+6. After the direct answer, include:
+   ### Image Summary
+   Summarize only the visible evidence relevant to the user's question.
+7. Keep the response focused and practical.
+"""
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are Adarsh AI. Answer strictly from the supplied visual evidence.",
+            },
+            {
+                "role": "user",
+                "content": synthesis_prompt,
+            },
+        ],
+        reasoning_effort="low",
+        max_completion_tokens=1200,
+    )
+    answer = str(response.choices[0].message.content or "").strip()
+    if not answer:
+        raise RuntimeError("The multi-image synthesis returned an empty response.")
+    return answer, response
+
+
+def get_image_chat_response(user_message, uploaded_images):
+    """Answer the user's prompt from up to five uploaded images."""
+    user_message = str(user_message).strip()[:4000]
+
+    if not uploaded_images:
+        raise ValueError("No image was uploaded.")
+
+    if len(uploaded_images) > MAX_IMAGES_PER_REQUEST:
+        raise ValueError(
+            f"A maximum of {MAX_IMAGES_PER_REQUEST} images can be analyzed at once."
         )
 
-    return (
-        clean_answer_for_display(answer),
-        response,
-        rag_sources,
-        rag_topic,
-    )
+    recent_messages = st.session_state.messages[:-1][-6:]
+    bounded_messages = []
+    for message in recent_messages:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(message.get("content", ""))[:1500]
+        if content:
+            bounded_messages.append({"role": role, "content": content})
+
+    rag_topic = detect_rag_topic(user_message)
+    rag_context = ""
+    rag_sources = []
+
+    if rag_topic:
+        rag_context, rag_sources = retrieve_trusted_context(
+            user_message,
+            rag_topic,
+            top_k=3,
+        )
+        st.session_state.last_rag_topic = rag_topic
+        st.session_state.last_rag_sources = rag_sources
+    else:
+        st.session_state.last_rag_topic = None
+        st.session_state.last_rag_sources = []
+
+    indexed_images = list(enumerate(uploaded_images, start=1))
+
+    # First try all uploaded images together. Qwen 3.6 supports five images.
+    # If the active key only has Qwen 3.8, its three-image limit is handled below
+    # by two safe batches (3 + 2), followed by a text-only synthesis pass.
+    try:
+        messages_for_ai = _build_vision_messages(
+            user_message,
+            indexed_images,
+            rag_context,
+            rag_topic,
+            bounded_messages,
+            evidence_only=False,
+        )
+        response = _call_vision_model(messages_for_ai)
+        answer = response.choices[0].message.content or ""
+        if not answer.strip():
+            raise RuntimeError(
+                "Groq vision returned an empty response. Please retry the image request."
+            )
+        return (
+            clean_answer_for_display(answer),
+            response,
+            rag_sources,
+            rag_topic,
+        )
+
+    except Exception as direct_error:
+        if len(indexed_images) <= 3 or not _is_image_count_limit_error(direct_error):
+            raise RuntimeError(
+                f"Groq vision request failed: {direct_error}"
+            ) from direct_error
+
+        # Fallback for keys that can access only Qwen 3.8 (max 3 images/request).
+        evidence_parts = []
+        for batch_start in range(0, len(indexed_images), 3):
+            batch = indexed_images[batch_start:batch_start + 3]
+            batch_messages = _build_vision_messages(
+                user_message,
+                batch,
+                rag_context,
+                rag_topic,
+                [],
+                evidence_only=True,
+            )
+            try:
+                batch_response = _call_vision_model(batch_messages)
+            except Exception as batch_error:
+                raise RuntimeError(
+                    f"Groq vision request failed while analyzing image batch "
+                    f"{batch[0][0]}-{batch[-1][0]}: {batch_error}"
+                ) from batch_error
+
+            batch_answer = str(batch_response.choices[0].message.content or "").strip()
+            if batch_answer:
+                evidence_parts.append(
+                    f"Images {batch[0][0]}-{batch[-1][0]} evidence:\n{batch_answer}"
+                )
+
+        if not evidence_parts:
+            raise RuntimeError("No usable visual evidence was returned from the uploaded images.")
+
+        try:
+            answer, synthesis_response = _synthesize_multi_batch_image_answer(
+                user_message,
+                evidence_parts,
+            )
+        except Exception as synthesis_error:
+            raise RuntimeError(
+                f"Visual evidence was collected, but the final answer could not be synthesized: {synthesis_error}"
+            ) from synthesis_error
+
+        return (
+            clean_answer_for_display(answer),
+            synthesis_response,
+            rag_sources,
+            rag_topic,
+        )
 
 
 def extract_sources(response):
@@ -3491,15 +3630,15 @@ if st.session_state.user_profile is None:
 if st.session_state.uploaded_images:
     st.caption(
         f"📎 {len(st.session_state.uploaded_images)} image(s) currently attached. "
-        f"Maximum {MAX_IMAGES_PER_REQUEST} images per request."
+        f"Maximum {MAX_IMAGES_PER_REQUEST} images per message."
     )
 
 uploader_key = f"image_uploader_{st.session_state.image_uploader_version}"
 
 # --- BUG FIX: Chhota "+" Icon wala uploader (Paste support ke saath) ---
-with st.popover("➕ Attach Image", help="Click to select from gallery or Paste an image here"):
+with st.popover("➕ Attach Image", help="Select up to 5 images. Uploading waits for your question."):
     uploaded_files = st.file_uploader(
-        "Upload or Paste Image(s)",
+        "Upload up to 5 Image(s)",
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
         key=uploader_key,
@@ -3550,16 +3689,12 @@ user_message = (user_message or "").strip()
 # PROCESS NEW QUESTION
 # =========================================================
 
-if user_message or submitted_images:
+# IMPORTANT: Selecting/uploading an image must NOT call Groq by itself.
+# The image is only an attachment. Vision analysis starts after the user
+# explicitly submits a text prompt through st.chat_input.
+if user_message:
 
     current_images = list(submitted_images)
-
-    if not user_message and current_images:
-        user_message = (
-            "Analyze the attached image(s). If they contain code or an error, "
-            "identify the error, explain the root cause, and provide the complete "
-            "corrected code when enough context is visible."
-        )
 
     if current_images:
         st.session_state.uploaded_images = []
