@@ -8,3 +8,4 @@ beautifulsoup4
 scikit-learn
 mysql-connector-python
 Pillow
+streamlit-chat-prompt==0.4.1

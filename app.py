@@ -19,6 +19,7 @@ from google.oauth2.service_account import Credentials
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from PIL import Image
+from streamlit_chat_prompt import prompt as chat_prompt
 
 # =========================================================
 # STREAMLIT UI CONFIGURATION
@@ -154,8 +155,6 @@ defaults = {
     "active_chat_id": None,
     "mysql_available": False,
     "mysql_last_error": "",
-    "uploaded_images": [],
-    "image_uploader_version": 0,
 }
 
 for key, value in defaults.items():
@@ -1555,8 +1554,6 @@ def start_new_chat():
 
     st.session_state.messages = []
     st.session_state.active_chat_id = None
-    st.session_state.uploaded_images = []
-    st.session_state.image_uploader_version += 1
 
 
 def pin_chat(chat_id):
@@ -3071,8 +3068,6 @@ with st.sidebar:
                 st.session_state.active_chat_id = None
                 st.session_state.messages = []
                 st.session_state.chat_history = []
-                st.session_state.uploaded_images = []
-                st.session_state.image_uploader_version += 1
                 st.session_state.show_login = True
                 st.rerun()
 
@@ -3257,8 +3252,6 @@ with st.sidebar:
                         chat["messages"].copy()
                     )
                     st.session_state.active_chat_id = chat["id"]
-                    st.session_state.uploaded_images = []
-                    st.session_state.image_uploader_version += 1
 
                     st.rerun()
 
@@ -3630,69 +3623,97 @@ for message in st.session_state.messages:
 # =========================================================
 # CHAT INPUT + IMAGE ATTACHMENTS
 # =========================================================
+#
+# Uses a dedicated chat-prompt component so images live INSIDE the
+# typing bar instead of appearing as a separate uploader above it.
+#
+# Supported:
+#   • + attachment button -> gallery/file picker
+#   • Ctrl+V / Cmd+V -> paste an image from the clipboard
+#   • up to 5 images per message
+#   • images remain attached while the user types
+#   • no vision request happens until the user explicitly sends a prompt
+#
+# The component is intentionally used here because native Streamlit
+# st.chat_input does not provide a documented clipboard-image paste API.
+# =========================================================
 
 if st.session_state.user_profile is None:
     st.caption(
         "🔐 Login with your Name + Date of Birth to save and restore chat history."
     )
 
-if st.session_state.uploaded_images:
-    st.caption(
-        f"📎 {len(st.session_state.uploaded_images)} image(s) attached. "
-        f"Maximum {MAX_IMAGES_PER_REQUEST} images per message."
-    )
+chat_submission = chat_prompt(
+    name="adarsh_ai_chat",
+    key="adarsh_ai_chat_prompt",
+    placeholder="Ask Adarsh AI anything…",
+    main_bottom=True,
+    max_image_size=MAX_IMAGE_SIZE_BYTES,
+    disabled=False,
+)
 
-uploader_key = f"image_uploader_{st.session_state.image_uploader_version}"
-
-# --- BUG FIX: Chhota "+" Icon wala uploader (Paste support ke saath) ---
-with st.popover("➕", help="Attach up to 5 images. Analysis starts only after you send a question."):
-    uploaded_files = st.file_uploader(
-        "Upload up to 5 Image(s)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-        key=uploader_key,
-        label_visibility="collapsed"
-    )
-    
-    if uploaded_files:
-        if st.button("🗑️ Clear Attachment", key=f"clear_attachment_{st.session_state.image_uploader_version}", use_container_width=True):
-            st.session_state.uploaded_images = []
-            st.session_state.image_uploader_version += 1
-            st.rerun()
-
+user_message = ""
 submitted_images = []
 
-if uploaded_files:
-    if len(uploaded_files) > MAX_IMAGES_PER_REQUEST:
+if chat_submission is not None:
+    user_message = str(getattr(chat_submission, "text", "") or "").strip()
+
+    component_images = list(getattr(chat_submission, "images", []) or [])
+
+    if len(component_images) > MAX_IMAGES_PER_REQUEST:
         st.error(
-            f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message."
+            f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message. "
+            "Please remove the extra images and send again."
         )
-    else:
-        for uploaded_file in uploaded_files:
-            image_bytes = uploaded_file.getvalue()
+        component_images = component_images[:MAX_IMAGES_PER_REQUEST]
+        user_message = ""
+
+    for index, image in enumerate(component_images, start=1):
+        try:
+            image_data = str(getattr(image, "data", "") or "")
+            image_type = str(
+                getattr(image, "type", "") or "image/png"
+            ).strip()
+
+            if not image_data:
+                continue
+
+            # streamlit-chat-prompt returns base64 image data.
+            image_bytes = base64.b64decode(image_data, validate=True)
+
+            if not image_bytes:
+                continue
 
             if len(image_bytes) > MAX_IMAGE_SIZE_BYTES:
                 st.error(
-                    f"❌ {uploaded_file.name} is larger than 20 MB. "
-                    "Please choose a smaller screenshot/image."
+                    f"❌ Image {index} is larger than "
+                    f"{MAX_IMAGE_SIZE_BYTES // (1024 * 1024)} MB."
                 )
                 continue
 
             submitted_images.append(
                 {
                     "bytes": image_bytes,
-                    "mime": uploaded_file.type or "image/jpeg",
-                    "name": uploaded_file.name,
+                    "mime": image_type,
+                    "name": f"pasted_or_attached_image_{index}.png",
                 }
             )
 
-# Normal text chat input
-user_message = st.chat_input(
-    "💬 Ask Adarsh AI anything...",
-    key="adarsh_chat_input",
-)
+        except Exception as image_error:
+            st.warning(
+                f"⚠️ Image {index} could not be read. "
+                "Please attach or paste it again."
+            )
 
-user_message = (user_message or "").strip()
+    # Images are allowed only as part of an explicit user question.
+    # This prevents accidental analysis when the user merely attaches
+    # an image and has not asked anything yet.
+    if submitted_images and not user_message:
+        st.warning(
+            "🖼️ Your image(s) are attached. Please type your question "
+            "before sending, for example: “What is causing this error?”"
+        )
+        submitted_images = []
 
 # =========================================================
 # PROCESS NEW QUESTION
@@ -3704,10 +3725,6 @@ user_message = (user_message or "").strip()
 if user_message:
 
     current_images = list(submitted_images)
-
-    if current_images:
-        st.session_state.uploaded_images = []
-        st.session_state.image_uploader_version += 1
 
     st.session_state.messages.append(
         {
@@ -3942,6 +3959,3 @@ if user_message:
                     language="text",
                 )
 
-        finally:
-            st.session_state.uploaded_images = []
-            st.session_state.image_uploader_version += 1
