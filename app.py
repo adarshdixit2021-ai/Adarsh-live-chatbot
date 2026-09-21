@@ -31,7 +31,7 @@ except Exception:
     pass
 
 st.set_page_config(
-    page_title="Adarsh AI",
+    page_title="Aether-AD27",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -41,6 +41,27 @@ st.set_page_config(
         "About": None,
     },
 )
+
+
+# =========================================================
+# TIME-BASED PERSONALIZED GREETING
+# =========================================================
+
+INDIA_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+
+def get_personalized_greeting(name):
+    """Return a personalized greeting based on the current India time."""
+    safe_name = str(name or "User").strip() or "User"
+    current_hour = datetime.now(INDIA_TIMEZONE).hour
+
+    if 5 <= current_hour < 12:
+        return f"🌅 Good Morning, {safe_name}!"
+    if 12 <= current_hour < 17:
+        return f"☀️ Good Afternoon, {safe_name}!"
+    if 17 <= current_hour < 21:
+        return f"🌆 Good Evening, {safe_name}!"
+    return f"🌙 Good Night, {safe_name}!"
 
 
 # =========================================================
@@ -125,7 +146,7 @@ if not mysql_ssl_ca:
 
 if not groq_api_key:
     st.error(
-        "❌ Adarsh AI is not configured correctly. "
+        "❌ Aether-AD27 is not configured correctly. "
         "GROQ_API_KEY is missing."
     )
     st.stop()
@@ -985,7 +1006,7 @@ def _ground_web_answer(user_message, evidence, conversation_messages):
         )
 
     grounding_system = """
-You are the final source-grounding layer of Adarsh AI.
+You are the final source-grounding layer of Aether-AD27.
 
 Your job is NOT to browse and NOT to use your pretrained knowledge for current facts.
 You may use ONLY the retrieved web evidence supplied below.
@@ -1727,11 +1748,11 @@ The application performs a separate source-grounding pass after Compound researc
 """ if web_mode else ""
 
     return f"""
-You are Adarsh AI, a personal AI assistant developed by Adarsh Dixit.
+You are Aether-AD27, a personal AI assistant developed by Adarsh Dixit.
 
 DEVELOPER IDENTITY:
 If asked who you are:
-"I'm Adarsh AI, a personal AI assistant developed by Adarsh Dixit."
+"I'm Aether-AD27, a personal AI assistant developed by Adarsh Dixit."
 
 If asked who your developer is:
 "My developer is Adarsh Dixit."
@@ -2253,7 +2274,7 @@ def _verify_and_rewrite_web_answer(answer, user_message, evidence, ledger):
         return answer
 
     verification_prompt = f"""
-You are the final numeric-fact verifier for Adarsh AI.
+You are the final numeric-fact verifier for Aether-AD27.
 
 Rewrite the DRAFT ANSWER using ONLY the supplied evidence.
 
@@ -2371,7 +2392,7 @@ Return only the answer with inline [S#] citations.
             messages=[
                 {
                     "role": "system",
-                    "content": "You are Adarsh AI's strict web-grounding answer generator. Use only supplied evidence.",
+                    "content": "You are Aether-AD27's strict web-grounding answer generator. Use only supplied evidence.",
                 },
                 {"role": "user", "content": prompt[:30000]},
             ],
@@ -2689,7 +2710,7 @@ def _build_vision_messages(user_message, image_infos, rag_context, rag_topic, bo
     vision_rules = """
 IMAGE / CODE DEBUGGING MODE
 
-You are Adarsh AI's visual analysis and code-debugging assistant.
+You are Aether-AD27's visual analysis and code-debugging assistant.
 The user has explicitly asked a question about the uploaded image(s).
 Your first responsibility is to answer THAT question from the visible image evidence.
 Do not start with a generic description of the image and do not discuss unrelated
@@ -2854,7 +2875,7 @@ def _synthesize_multi_batch_image_answer(user_message, evidence_parts):
     """Synthesize batched visual evidence into a complete, ordered answer."""
     evidence_text = "\n\n".join(evidence_parts)
     synthesis_prompt = f"""
-You are the final answer writer for Adarsh AI. The user uploaded up to five images,
+You are the final answer writer for Aether-AD27. The user uploaded up to five images,
 and the visual evidence below was collected in batches.
 
 USER REQUEST:
@@ -2892,7 +2913,7 @@ Return a polished answer suitable for submitting as study/assignment notes.
             {
                 "role": "system",
                 "content": (
-                    "You are Adarsh AI's final visual-answer writer. "
+                    "You are Aether-AD27's final visual-answer writer. "
                     "Complete every requested numbered question using only the supplied evidence."
                 ),
             },
@@ -3066,7 +3087,7 @@ with st.sidebar:
         )
         st.caption("Your Personal AI Assistant")
     else:
-        st.markdown("## 🤖 Adarsh AI")
+        st.markdown("## 🤖 Aether-AD27")
         st.caption("Your Personal AI Assistant")
 
     if st.session_state.user_profile:
@@ -3458,10 +3479,12 @@ if st.session_state.user_profile:
 
     name = st.session_state.user_profile["name"]
 
-    if not st.session_state.messages:
+    # Always show a fresh IST-based greeting after the user profile is active.
+    # This also works when saved chat history is restored.
+    st.markdown(f"# {get_personalized_greeting(name)}")
+    st.caption("Your Personal AI Assistant")
 
-        st.markdown(f"# 🤖 Hi {name}!")
-        st.caption("Your Personal AI Assistant")
+    if not st.session_state.messages:
 
         st.markdown(
             "Ask anything, learn step-by-step, solve coding problems, "
@@ -3515,14 +3538,13 @@ if st.session_state.user_profile:
 
     else:
 
-        st.markdown("# 🤖 Adarsh AI")
         st.caption(
             "Clear answers • Simple explanations • Focused assistance"
         )
 
 else:
 
-    st.markdown("# 🤖 Adarsh AI")
+    st.markdown("# 🤖 Aether-AD27")
     st.caption("Your Personal AI Assistant")
 
     st.markdown(
@@ -3533,7 +3555,7 @@ else:
     st.divider()
 
     with st.container(border=True):
-        st.markdown("### 👋 Welcome to Adarsh AI")
+        st.markdown("### 👋 Welcome to Aether-AD27")
         st.write(
             "Ask about programming, mathematics, technology, "
             "Artificial Intelligence, Data Science or everyday questions."
@@ -3665,7 +3687,7 @@ for message in st.session_state.messages:
 # Supported:
 #   • attachment button inside the typing bar
 #   • gallery/file picker on desktop and mobile
-#   • Ctrl+V / Cmd+V image paste from clipboard
+#   • Native attachment/file selection supported by the installed Streamlit version
 #   • up to 5 images per message (validated server-side)
 #   • image analysis starts ONLY after the user submits a text prompt
 #   • no separate uploader above the chat box
@@ -3677,7 +3699,7 @@ if st.session_state.user_profile is None:
     )
 
 chat_submission = st.chat_input(
-    "Ask Adarsh AI anything…",
+    "Ask Aether-AD27 anything…",
     key="adarsh_ai_chat_prompt",
     accept_file="multiple",
     file_type=["png", "jpg", "jpeg", "webp"],
@@ -3898,7 +3920,7 @@ if user_message:
 
         except Exception as error:
 
-            print("\n[Adarsh AI] Request failed:")
+            print("\n[Aether-AD27] Request failed:")
             traceback.print_exc()
 
             error_text = str(error).lower()
