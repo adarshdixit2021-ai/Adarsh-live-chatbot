@@ -175,9 +175,8 @@ SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 # The app checks which candidates are accessible to the current API key and
 # automatically falls back if one model returns model_not_found.
 VISION_MODEL_CANDIDATES = (
-    # Qwen 3.6 supports up to 5 images in one request. If it is not
-    # accessible, the app falls back to Qwen 3.8 and batches 4-5 images.
-    "qwen/qwen3.6-27b",
+    # Current Groq vision model. Qwen 3.8 supports up to 3 images/request;
+    # the app handles 4-5 images through automatic 3+2 batching.
     "qwen/qwen3.8-27b",
 )
 VISION_MODEL = VISION_MODEL_CANDIDATES[0]
@@ -2620,55 +2619,52 @@ def _is_model_not_found_error(error):
     )
 
 
-def _call_vision_model(messages_for_ai):
-    """
-    Call Groq vision with automatic model fallback.
-
-    If one current vision model is unavailable for the API key/project,
-    the next supported model is tried automatically.
-    """
-    last_model_error = None
+def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
+    """Call the current Groq vision model with a configurable output budget."""
     candidate_models = _get_accessible_vision_models()
+    last_model_error = None
 
     for model_id in candidate_models:
         try:
             return client.chat.completions.create(
                 model=model_id,
                 messages=messages_for_ai,
-                max_completion_tokens=700,
+                max_completion_tokens=max_completion_tokens,
                 reasoning_effort="none",
                 temperature=0.2,
             )
-
         except Exception as first_error:
             error_text = str(first_error).lower()
 
-            # 404/model_not_found -> try the next current vision model.
             if _is_model_not_found_error(first_error):
                 last_model_error = first_error
                 continue
 
-            # Groq can enforce an output-tokens-per-minute limit. Retry once
-            # with a smaller output budget for that specific condition.
+            # If Groq reports an output-token-per-minute limit, retry with a
+            # smaller budget rather than failing the whole image request.
             is_otpm_limit = (
                 "429" in error_text
                 and (
                     "output tokens per minute" in error_text
                     or "otpm" in error_text
-                    or (
-                        "requested" in error_text
-                        and "tokens" in error_text
-                    )
+                    or ("requested" in error_text and "tokens" in error_text)
                 )
             )
-
             if is_otpm_limit:
-                time.sleep(0.8)
+                # Groq may expose retry-after on the SDK exception response.
+                retry_after = 2.0
+                try:
+                    headers = getattr(getattr(first_error, "response", None), "headers", {}) or {}
+                    retry_after = float(headers.get("retry-after", retry_after))
+                except Exception:
+                    pass
+                time.sleep(min(max(retry_after, 1.0), 15.0))
+                retry_budget = min(max_completion_tokens, 1200)
                 try:
                     return client.chat.completions.create(
                         model=model_id,
                         messages=messages_for_ai,
-                        max_completion_tokens=450,
+                        max_completion_tokens=retry_budget,
                         reasoning_effort="none",
                         temperature=0.2,
                     )
@@ -2682,11 +2678,9 @@ def _call_vision_model(messages_for_ai):
 
     raise RuntimeError(
         "No supported Groq vision model is accessible with the current "
-        "GROQ_API_KEY/project. Groq currently lists Qwen 3.8 27B and Qwen "
-        "3.6 27B as vision-capable models, but this API key returned "
-        "model_not_found for the available candidates. Check that the "
-        "Streamlit Cloud GROQ_API_KEY is the correct active Groq key and "
-        "that the key/project has access to a vision model."
+        "GROQ_API_KEY/project. The app uses Groq's current Qwen 3.8 27B "
+        "vision model. Check that the Streamlit Cloud GROQ_API_KEY is active "
+        "and has access to this model."
     ) from last_model_error
 
 
@@ -2714,13 +2708,27 @@ STRICT VISUAL GROUNDING
 RESPONSE ORDER
 Always follow this order:
 ### Answer to Your Question
-Give the direct answer first. Answer exactly what the user asked, using the uploaded
-image(s) as the evidence.
+Answer the user's exact request first. If the uploaded image contains a numbered
+assignment/question sheet and the user asks to answer it, identify EVERY visible
+numbered question and answer EVERY one in order. Never stop after the first few
+questions merely because the response is long. Do not omit a question that is clearly
+readable. Preserve the question numbering (Ques-1, Ques-2, etc.).
+
+For multi-question assignments:
+- Give a separate heading for each question.
+- Give a complete, study-ready answer, not a one-line definition.
+- Use enough detail to explain the concept clearly, normally about 150-300 words
+  per question when the image and user request support that level of detail.
+- Include definitions, key points, examples, differences, steps, or strategies when
+  they are directly relevant to that question.
+- Do not pad answers with unrelated information just to increase length.
+- If a question is partially unreadable, state that specific limitation instead of
+  inventing the missing wording.
 
 ### Image Summary
-After the answer, give a short summary of the visible evidence that is relevant to
-the user's question. Do NOT turn this into a general image-description dump. Mention
-only the visible details that support, clarify, or qualify the answer.
+After ALL requested questions have been answered, give a short summary of only the
+image evidence relevant to the user's request. Do NOT turn this into a generic image
+description.
 
 CODE DEBUGGING RULES
 When the image contains source code, compiler output, terminal output, stack traces,
@@ -2751,8 +2759,11 @@ is relevant to the user's question.
 BATCH EVIDENCE MODE
 This is an internal evidence pass because the user uploaded more images than one
 vision request can safely contain. Do NOT give a generic image description.
-Extract only the visual facts/evidence needed to answer the user's exact question.
-Keep the evidence concise and label image numbers where useful. Do not speculate.
+Read and preserve every visible numbered question, important definition, table,
+error, code line, or other evidence needed to answer the user's exact request.
+Keep the evidence concise but complete enough that a later synthesis step can answer
+EVERY question without losing question numbers or important wording. Label image
+numbers where useful. Do not speculate.
 """
 
     messages_for_ai = [
@@ -2840,28 +2851,39 @@ def _is_image_count_limit_error(error):
 
 
 def _synthesize_multi_batch_image_answer(user_message, evidence_parts):
-    """Turn multiple vision evidence passes into one focused user-facing answer."""
+    """Synthesize batched visual evidence into a complete, ordered answer."""
     evidence_text = "\n\n".join(evidence_parts)
     synthesis_prompt = f"""
-You are answering a user's question using evidence extracted from up to five uploaded images.
+You are the final answer writer for Adarsh AI. The user uploaded up to five images,
+and the visual evidence below was collected in batches.
 
-USER QUESTION:
+USER REQUEST:
 {user_message[:4000]}
 
-VISUAL EVIDENCE FROM THE UPLOADED IMAGES:
-{evidence_text[:12000]}
+VISUAL EVIDENCE:
+{evidence_text[:16000]}
 
-Rules:
-1. Answer the user's exact question first.
-2. Use only the supplied visual evidence; do not invent or add unrelated facts.
-3. If evidence is uncertain, say so.
-4. Do not discuss visual details that are irrelevant to the question.
-5. If the question is about code/error/debugging, explain the root cause and give the
-   corrected code only when the evidence is sufficient.
-6. After the direct answer, include:
-   ### Image Summary
-   Summarize only the visible evidence relevant to the user's question.
-7. Keep the response focused and practical.
+MANDATORY RULES:
+1. Answer the user's exact request first.
+2. If the images contain a numbered question/assignment sheet, identify every
+   visible question and answer EVERY question in numerical order. Never skip a
+   readable question because the response is long.
+3. Preserve the original question numbering and wording as closely as the evidence
+   allows (for example, Ques-1 through Ques-6).
+4. Each answer must be complete and study-ready. Give definitions, explanations,
+   key points, examples, comparisons, steps, or strategies where directly relevant.
+5. Aim for roughly 150-300 words per assignment question when the source and user
+   request support that detail. Do not add irrelevant filler.
+6. Use ONLY the supplied visual evidence. Do not invent missing question text or facts.
+7. If a specific part of a question is unreadable, say exactly which part is unclear.
+8. After all questions are answered, include:
+
+### Image Summary
+Only summarize image details that are relevant to the user's request.
+9. Do not describe unrelated UI, phone status bars, logos, dates, or other visible
+   elements unless they matter to the user's question.
+
+Return a polished answer suitable for submitting as study/assignment notes.
 """
 
     response = client.chat.completions.create(
@@ -2869,15 +2891,15 @@ Rules:
         messages=[
             {
                 "role": "system",
-                "content": "You are Adarsh AI. Answer strictly from the supplied visual evidence.",
+                "content": (
+                    "You are Adarsh AI's final visual-answer writer. "
+                    "Complete every requested numbered question using only the supplied evidence."
+                ),
             },
-            {
-                "role": "user",
-                "content": synthesis_prompt,
-            },
+            {"role": "user", "content": synthesis_prompt},
         ],
         reasoning_effort="low",
-        max_completion_tokens=1200,
+        max_completion_tokens=3500,
     )
     answer = str(response.choices[0].message.content or "").strip()
     if not answer:
@@ -2925,38 +2947,9 @@ def get_image_chat_response(user_message, uploaded_images):
 
     indexed_images = list(enumerate(uploaded_images, start=1))
 
-    # First try all uploaded images together. Qwen 3.6 supports five images.
-    # If the active key only has Qwen 3.8, its three-image limit is handled below
-    # by two safe batches (3 + 2), followed by a text-only synthesis pass.
-    try:
-        messages_for_ai = _build_vision_messages(
-            user_message,
-            indexed_images,
-            rag_context,
-            rag_topic,
-            bounded_messages,
-            evidence_only=False,
-        )
-        response = _call_vision_model(messages_for_ai)
-        answer = response.choices[0].message.content or ""
-        if not answer.strip():
-            raise RuntimeError(
-                "Groq vision returned an empty response. Please retry the image request."
-            )
-        return (
-            clean_answer_for_display(answer),
-            response,
-            rag_sources,
-            rag_topic,
-        )
-
-    except Exception as direct_error:
-        if len(indexed_images) <= 3 or not _is_image_count_limit_error(direct_error):
-            raise RuntimeError(
-                f"Groq vision request failed: {direct_error}"
-            ) from direct_error
-
-        # Fallback for keys that can access only Qwen 3.8 (max 3 images/request).
+    # Current Qwen 3.8 accepts at most 3 images/request. For 4-5 images,
+    # batch as 3+2 immediately instead of making a failed 5-image request.
+    if len(indexed_images) > 3:
         evidence_parts = []
         for batch_start in range(0, len(indexed_images), 3):
             batch = indexed_images[batch_start:batch_start + 3]
@@ -2969,7 +2962,10 @@ def get_image_chat_response(user_message, uploaded_images):
                 evidence_only=True,
             )
             try:
-                batch_response = _call_vision_model(batch_messages)
+                batch_response = _call_vision_model(
+                    batch_messages,
+                    max_completion_tokens=1600,
+                )
             except Exception as batch_error:
                 raise RuntimeError(
                     f"Groq vision request failed while analyzing image batch "
@@ -2981,6 +2977,11 @@ def get_image_chat_response(user_message, uploaded_images):
                 evidence_parts.append(
                     f"Images {batch[0][0]}-{batch[-1][0]} evidence:\n{batch_answer}"
                 )
+
+            # Avoid immediately stacking another Qwen request into the same
+            # token window on rate-limited Groq developer keys.
+            if batch_start + 3 < len(indexed_images):
+                time.sleep(2.5)
 
         if not evidence_parts:
             raise RuntimeError("No usable visual evidence was returned from the uploaded images.")
@@ -3001,6 +3002,40 @@ def get_image_chat_response(user_message, uploaded_images):
             rag_sources,
             rag_topic,
         )
+
+    # For one image, allow a large enough response for multi-question assignments.
+    # For two/three images, keep the budget conservative enough for Groq TPM limits.
+    output_budget = 3500 if len(indexed_images) == 1 else 2000
+
+    try:
+        messages_for_ai = _build_vision_messages(
+            user_message,
+            indexed_images,
+            rag_context,
+            rag_topic,
+            bounded_messages,
+            evidence_only=False,
+        )
+        response = _call_vision_model(
+            messages_for_ai,
+            max_completion_tokens=output_budget,
+        )
+        answer = response.choices[0].message.content or ""
+        if not answer.strip():
+            raise RuntimeError(
+                "Groq vision returned an empty response. Please retry the image request."
+            )
+        return (
+            clean_answer_for_display(answer),
+            response,
+            rag_sources,
+            rag_topic,
+        )
+
+    except Exception as direct_error:
+        raise RuntimeError(
+            f"Groq vision request failed: {direct_error}"
+        ) from direct_error
 
 
 def extract_sources(response):
