@@ -20,10 +20,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from PIL import Image
 
-# =========================================================
-# STREAMLIT UI CONFIGURATION
-# =========================================================
-
 try:
     st.set_option("client.toolbarMode", "minimal")
     st.set_option("client.showSidebarNavigation", False)
@@ -42,13 +38,7 @@ st.set_page_config(
     },
 )
 
-
-# =========================================================
-# ENVIRONMENT / SECRETS
-# =========================================================
-
 load_dotenv()
-
 
 def _clean_config_value(value, default=None):
     """Return a stripped configuration value, treating blank strings as missing."""
@@ -56,7 +46,6 @@ def _clean_config_value(value, default=None):
         return default
     value = str(value).strip()
     return value if value else default
-
 
 def _get_secret_value(key, default=None):
     """Read a Streamlit secret safely, supporting both flat and grouped secrets."""
@@ -67,7 +56,6 @@ def _get_secret_value(key, default=None):
     except Exception:
         pass
 
-    # Also support an optional [mysql] section in Streamlit Secrets.
     try:
         mysql_section = st.secrets.get("mysql")
         if mysql_section and key.startswith("MYSQL_"):
@@ -80,12 +68,9 @@ def _get_secret_value(key, default=None):
 
     return default
 
-
 groq_api_key = _clean_config_value(os.getenv("GROQ_API_KEY"))
 google_sheet_id = _clean_config_value(os.getenv("GOOGLE_SHEET_ID"))
 
-# Local development uses .env. Streamlit Cloud uses st.secrets.
-# Environment variables take priority when they contain a real value.
 if not groq_api_key:
     groq_api_key = _clean_config_value(_get_secret_value("GROQ_API_KEY"))
 
@@ -110,8 +95,6 @@ for _mysql_key, _mysql_variable in (
             _get_secret_value(_mysql_key)
         )
 
-# Aiven requires an encrypted MySQL connection. These optional settings also
-# allow a CA certificate to be supplied later without changing application code.
 mysql_ssl_ca = _clean_config_value(os.getenv("MYSQL_SSL_CA"))
 mysql_ssl_verify_cert = _clean_config_value(
     os.getenv("MYSQL_SSL_VERIFY_CERT"), "false"
@@ -135,11 +118,6 @@ client = Groq(
     default_headers={"Groq-Model-Version": "latest"},
 )
 
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-
 defaults = {
     "messages": [],
     "chat_history": [],
@@ -147,13 +125,14 @@ defaults = {
     "show_login": False,
     "beginner_mode": True,
     "web_search": False,
-    "feedback_sent": False,
     "last_rag_sources": [],
     "last_rag_topic": None,
     "mysql_user_id": None,
     "active_chat_id": None,
     "mysql_available": False,
     "mysql_last_error": "",
+    "uploaded_images": [],
+    "image_uploader_version": 0,
 }
 
 for key, value in defaults.items():
@@ -164,26 +143,11 @@ st.session_state.mysql_available = bool(
     mysql_host and mysql_database and mysql_user and mysql_password
 )
 
-
-# =========================================================
-# CONSTANTS
-# =========================================================
-
 SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 
-# Vision models currently supported by Groq.
-# The app checks which candidates are accessible to the current API key and
-# automatically falls back if one model returns model_not_found.
-VISION_MODEL_CANDIDATES = (
-    # Current Groq vision model. Qwen 3.8 supports up to 3 images/request;
-    # the app handles 4-5 images through automatic 3+2 batching.
-    "qwen/qwen3.8-27b",
-)
-VISION_MODEL = VISION_MODEL_CANDIDATES[0]
+VISION_MODEL = "llama-3.2-90b-vision-preview"
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
-# User can attach at most five images to one message.
 MAX_IMAGES_PER_REQUEST = 5
-# A single 3-image fallback batch stays below the safe API payload budget.
 MAX_IMAGE_API_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_IMAGE_API_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_DISPLAY_WIDTH = 180
@@ -191,9 +155,6 @@ MAX_IMAGE_DISPLAY_WIDTH = 180
 FEEDBACK_START_DATE = date(2026, 9, 15)
 FEEDBACK_END_DATE = FEEDBACK_START_DATE + timedelta(days=9)
 
-# Web research safeguards. Compound supports multiple tool calls, including
-# web search and website visits, which is preferable for research-heavy
-# current-information questions.
 WEB_EXCLUDE_DOMAINS = [
     "instagram.com",
     "facebook.com",
@@ -212,10 +173,6 @@ WEB_MAX_PAGE_BYTES = 2_500_000
 WEB_RETRY_DELAY_SECONDS = 0.7
 
 feedback_available = date.today() <= FEEDBACK_END_DATE
-
-# =========================================================
-# RAG / TRUSTED KNOWLEDGE SOURCES
-# =========================================================
 
 RAG_SOURCES = {
     "bbdu": [
@@ -298,10 +255,6 @@ RAG_KEYWORDS = {
     ],
 }
 
-# =========================================================
-# HELPERS
-# =========================================================
-
 def detect_rag_topic(text):
     """Return the trusted knowledge category relevant to the question."""
     text_lower = text.lower().strip()
@@ -326,7 +279,6 @@ def detect_rag_topic(text):
 
     matches.sort(reverse=True)
     return matches[0][1]
-
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def fetch_webpage_text(url):
@@ -383,7 +335,6 @@ def fetch_webpage_text(url):
 
     raise last_error
 
-
 def chunk_text(text, chunk_size=350, overlap=50):
     """Create small overlapping text chunks for lightweight RAG."""
     words = text.split()
@@ -403,13 +354,11 @@ def chunk_text(text, chunk_size=350, overlap=50):
 
     return chunks
 
-
 def _normalise_rag_text(text):
     text = text.lower()
     text = text.replace("₹", " inr ")
     text = re.sub(r"[^a-z0-9₹]+", " ", text)
     return " ".join(text.split())
-
 
 def _query_terms(question):
     """Return useful search terms, including common BBDU/Hinglish synonyms."""
@@ -436,7 +385,6 @@ def _query_terms(question):
         expanded.update(expansions.get(term, []))
 
     return list(expanded)
-
 
 def _bbdu_source_priority(question):
     """Put the most likely official BBDU page first for the user's question."""
@@ -492,7 +440,6 @@ def _bbdu_source_priority(question):
         key=score,
         reverse=True,
     )
-
 
 def _extract_evidence_snippets(text, question, max_snippets=4):
     """Extract short evidence windows around important query terms."""
@@ -553,7 +500,6 @@ def _extract_evidence_snippets(text, question, max_snippets=4):
 
     return snippets
 
-
 def retrieve_trusted_context(question, topic, top_k=3):
     """Retrieve trusted evidence using source routing + keyword evidence + TF-IDF."""
     documents = []
@@ -562,7 +508,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
 
     if topic == "bbdu":
         candidate_sources = _bbdu_source_priority(question)
-        # For focused BBDU questions, do not waste requests on unrelated pages.
         candidate_sources = candidate_sources[:4]
     else:
         candidate_sources = RAG_SOURCES.get(topic, [])
@@ -574,8 +519,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
         try:
             page_text = fetch_webpage_text(url)
 
-            # Direct evidence snippets are more reliable than relying only on
-            # statistical similarity for facts such as fees and eligibility.
             snippets = _extract_evidence_snippets(
                 page_text,
                 question,
@@ -598,7 +541,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
     if not documents:
         return "", []
 
-    # Lexical relevance is calculated first so short factual evidence wins.
     lexical_scores = []
     for index, document in enumerate(documents):
         doc = _normalise_rag_text(document)
@@ -614,7 +556,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
 
         lexical_scores.append(score)
 
-    # TF-IDF adds semantic-ish ranking without introducing a vector database.
     tfidf_scores = [0.0] * len(documents)
     try:
         vectorizer = TfidfVectorizer(
@@ -652,7 +593,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
         if not chunk:
             continue
 
-        # Hard limit each retrieved chunk.
         chunk = chunk[:1800]
         chunk_key = chunk.lower()
 
@@ -684,7 +624,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
 def is_rag_question(text):
     return detect_rag_topic(text) is not None
 
-
 def is_current_information_question(text):
     """Return True when the question clearly depends on fresh web information."""
     text = str(text).lower().strip()
@@ -705,8 +644,6 @@ def is_current_information_question(text):
     if any(phrase in text for phrase in current_phrases):
         return True
 
-    # Explicit recent years usually indicate that the user wants current
-    # information rather than static model knowledge.
     for year in ("2025", "2026", "2027"):
         if year in text and any(
             marker in text
@@ -730,7 +667,6 @@ def web_search_settings(question):
 
     return settings
 
-
 def _safe_url(url):
     """Accept only normal public http/https URLs for displayed evidence."""
     url = str(url or "").strip()
@@ -742,13 +678,11 @@ def _safe_url(url):
         pass
     return ""
 
-
 def _domain(url):
     try:
         return urlparse(url).netloc.lower().split(":", 1)[0].removeprefix("www.")
     except Exception:
         return ""
-
 
 def _source_quality_bonus(url):
     """Rank source domains without claiming that a domain is automatically true."""
@@ -777,7 +711,6 @@ def _source_quality_bonus(url):
         return 0.20
     return 0.0
 
-
 def _extract_page_text(html):
     """Extract readable text from a fetched public HTML page."""
     try:
@@ -790,7 +723,6 @@ def _extract_page_text(html):
         return text
     except Exception:
         return ""
-
 
 def _fetch_source_page(url):
     """Fetch the actual public source page so grounding is not based only on snippets."""
@@ -831,7 +763,6 @@ def _fetch_source_page(url):
     except Exception:
         return ""
 
-
 def _enrich_web_evidence_with_pages(evidence):
     """Replace snippet-only evidence with actual fetched page text where possible."""
     enriched = []
@@ -859,7 +790,6 @@ def _enrich_web_evidence_with_pages(evidence):
     )
     return enriched[:WEB_MAX_EVIDENCE_SOURCES], fetch_count
 
-
 def _validate_citations(answer, evidence):
     """Reject answers containing missing/invalid citation markers."""
     if not answer or not evidence:
@@ -870,13 +800,11 @@ def _validate_citations(answer, evidence):
     valid_max = len(evidence)
     return all(1 <= int(number) <= valid_max for number in markers)
 
-
 def _field(obj, name, default=None):
     """Read a field from either a Groq SDK object or a plain dict."""
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
-
 
 def _extract_web_evidence(response):
     """Extract search/visit evidence from Groq Compound in SDK-safe form."""
@@ -968,7 +896,6 @@ def _build_web_evidence_block(evidence):
 
     return "\n\n---\n\n".join(blocks)
 
-
 def _ground_web_answer(user_message, evidence, conversation_messages):
     """Generate the final answer ONLY from retrieved evidence.
 
@@ -1057,13 +984,11 @@ Write the final answer now. Use inline [S#] citations for factual claims.
 def _set_mysql_error(error):
     """Store a safe MySQL diagnostic without exposing credentials."""
     message = str(error or "").strip()
-    # Never display a password if a connector error happens to include it.
     for secret in (mysql_password, groq_api_key):
         if secret:
             message = message.replace(str(secret), "***")
     st.session_state.mysql_last_error = message[:2000]
     st.session_state.mysql_available = False
-
 
 def get_mysql_connection():
     """Create a fresh MySQL connection for local MySQL or a cloud provider such as Aiven."""
@@ -1091,8 +1016,6 @@ def get_mysql_connection():
             "password": str(mysql_password),
             "connection_timeout": 10,
             "autocommit": False,
-            # Aiven requires TLS. For normal Aiven connections the connector
-            # negotiates TLS without requiring a locally downloaded CA file.
             "ssl_disabled": False,
             "ssl_verify_cert": mysql_ssl_verify_cert,
             "ssl_verify_identity": mysql_ssl_verify_identity,
@@ -1100,8 +1023,6 @@ def get_mysql_connection():
 
         if mysql_ssl_ca:
             connection_options["ssl_ca"] = str(mysql_ssl_ca).strip()
-            # When a CA is explicitly supplied, certificate verification is
-            # enabled unless the user deliberately disabled it in config.
             if "MYSQL_SSL_VERIFY_CERT" not in os.environ:
                 connection_options["ssl_verify_cert"] = True
 
@@ -1112,7 +1033,6 @@ def get_mysql_connection():
     except Exception as error:
         _set_mysql_error(f"MySQL connection failed: {error}")
         return None
-
 
 def test_mysql_connection():
     """Return (True, message) only when the database is actually reachable."""
@@ -1214,7 +1134,6 @@ def ensure_mysql_schema():
         cursor.close()
         connection.close()
 
-
 def get_or_create_mysql_user(name, dob, gender, profession):
     """Match account only by name + date of birth; create if no match exists."""
     connection = get_mysql_connection()
@@ -1260,7 +1179,6 @@ def get_or_create_mysql_user(name, dob, gender, profession):
             connection.commit()
             return cursor.lastrowid, True, None
         except mysql.connector.Error as error:
-            # A simultaneous login may have created the same identity.
             if getattr(error, "errno", None) == 1062:
                 connection.rollback()
                 cursor.execute(
@@ -1285,7 +1203,6 @@ def get_or_create_mysql_user(name, dob, gender, profession):
     finally:
         cursor.close()
         connection.close()
-
 
 def load_mysql_chat_history(user_id):
     """Load all saved chats and messages belonging only to this user."""
@@ -1346,7 +1263,6 @@ def load_mysql_chat_history(user_id):
         cursor.close()
         connection.close()
 
-
 def ensure_active_mysql_chat(first_user_message):
     """Create the current chat on first message when a user is logged in."""
     if not st.session_state.mysql_user_id:
@@ -1379,7 +1295,6 @@ def ensure_active_mysql_chat(first_user_message):
     )
     return chat_id
 
-
 def create_mysql_chat(user_id, first_user_message):
     """Create one persistent chat and return its database ID."""
     connection = get_mysql_connection()
@@ -1406,7 +1321,6 @@ def create_mysql_chat(user_id, first_user_message):
     finally:
         cursor.close()
         connection.close()
-
 
 def save_mysql_message(chat_id, role, content):
     """Persist one chat message."""
@@ -1438,7 +1352,6 @@ def save_mysql_message(chat_id, role, content):
         cursor.close()
         connection.close()
 
-
 def update_mysql_chat_pin(chat_id, pinned):
     connection = get_mysql_connection()
     if connection is None:
@@ -1458,7 +1371,6 @@ def update_mysql_chat_pin(chat_id, pinned):
     finally:
         cursor.close()
         connection.close()
-
 
 def delete_mysql_chat(chat_id):
     connection = get_mysql_connection()
@@ -1480,7 +1392,6 @@ def delete_mysql_chat(chat_id):
         cursor.close()
         connection.close()
 
-
 def delete_all_mysql_chats():
     connection = get_mysql_connection()
     if connection is None:
@@ -1501,7 +1412,6 @@ def delete_all_mysql_chats():
         cursor.close()
         connection.close()
 
-
 def clean_answer_for_display(answer):
     """Prevent common LaTeX delimiters from appearing as raw text."""
     answer = answer.replace(r"\(", "$")
@@ -1510,7 +1420,6 @@ def clean_answer_for_display(answer):
     answer = answer.replace(r"\]", "$$")
     answer = answer.replace("\\**", "**")
     return answer.strip()
-
 
 def save_current_chat():
     """Keep guest chats in session; logged-in chats are already in MySQL."""
@@ -1545,14 +1454,14 @@ def save_current_chat():
         }
     )
 
-
 def start_new_chat():
     if st.session_state.messages and not st.session_state.mysql_user_id:
         save_current_chat()
 
     st.session_state.messages = []
     st.session_state.active_chat_id = None
-
+    st.session_state.uploaded_images = []
+    st.session_state.image_uploader_version += 1
 
 def pin_chat(chat_id):
     for chat in st.session_state.chat_history:
@@ -1564,7 +1473,6 @@ def pin_chat(chat_id):
                     chat["pinned"],
                 )
             break
-
 
 def delete_chat(chat_id):
     if st.session_state.mysql_user_id:
@@ -1579,8 +1487,6 @@ def delete_chat(chat_id):
     if st.session_state.active_chat_id == chat_id:
         st.session_state.active_chat_id = None
         st.session_state.messages = []
-
-
 
 def connect_google_sheet():
     """Use Streamlit Secrets on Cloud or local JSON during local development."""
@@ -1624,11 +1530,9 @@ def connect_google_sheet():
     except Exception:
         return None
 
-
 @st.cache_resource
 def get_google_sheet():
     return connect_google_sheet()
-
 
 def save_feedback(feedback_text, rating):
     worksheet = get_google_sheet()
@@ -1666,7 +1570,6 @@ def save_feedback(feedback_text, rating):
 
     except Exception:
         return False
-
 
 def build_system_prompt(rag_context="", rag_topic=None, web_mode=False):
     rag_rules = ""
@@ -1869,7 +1772,6 @@ Avoid:
 - Long introductions
 """
 
-
 def _direct_web_search(query, max_results=7):
     """Search the public web and aggregate multiple providers before ranking.
 
@@ -1901,9 +1803,6 @@ def _direct_web_search(query, max_results=7):
         "Cache-Control": "no-cache",
     }
 
-    # Prefer authoritative first-party sources when the question names an
-    # organization. This is especially important for statistics and release
-    # dates. These are ranking hints, not factual answers.
     entity_domains = []
     q_lower = query.lower()
     entity_map = {
@@ -1923,8 +1822,6 @@ def _direct_web_search(query, max_results=7):
 
     queries = [query]
     if entity_domains:
-        # Search engines generally understand site: filters better than relying
-        # on snippets from unrelated publishers.
         queries.append(f"site:{entity_domains[0]} {query}"[:500])
 
     all_results = []
@@ -1950,7 +1847,6 @@ def _direct_web_search(query, max_results=7):
         })
 
     for current_query in queries:
-        # Google News RSS
         try:
             rss_url = (
                 "https://news.google.com/rss/search?"
@@ -1970,7 +1866,6 @@ def _direct_web_search(query, max_results=7):
         except Exception as error:
             errors.append(f"Google News RSS: {type(error).__name__}: {error}")
 
-        # Brave
         try:
             brave_url = f"https://search.brave.com/search?q={quote_plus(current_query)}&source=web"
             response = requests.get(brave_url, headers=headers, timeout=12)
@@ -1986,7 +1881,6 @@ def _direct_web_search(query, max_results=7):
         except Exception as error:
             errors.append(f"Brave: {type(error).__name__}: {error}")
 
-        # DuckDuckGo
         try:
             ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(current_query)}&kl=in-en"
             response = requests.get(ddg_url, headers=headers, timeout=12)
@@ -2003,7 +1897,6 @@ def _direct_web_search(query, max_results=7):
         except Exception as error:
             errors.append(f"DuckDuckGo: {type(error).__name__}: {error}")
 
-        # Bing
         try:
             bing_url = f"https://www.bing.com/search?q={quote_plus(current_query)}&setlang=en-IN"
             response = requests.get(bing_url, headers=headers, timeout=12)
@@ -2019,7 +1912,6 @@ def _direct_web_search(query, max_results=7):
         except Exception as error:
             errors.append(f"Bing: {type(error).__name__}: {error}")
 
-        # Google
         try:
             google_url = f"https://www.google.com/search?q={quote_plus(current_query)}&hl=en&num=10"
             response = requests.get(google_url, headers=headers, timeout=12)
@@ -2039,14 +1931,12 @@ def _direct_web_search(query, max_results=7):
         except Exception as error:
             errors.append(f"Google: {type(error).__name__}: {error}")
 
-    # Deduplicate URLs and rank authoritative sources above generic results.
     deduped = {}
     for item in all_results:
         key = item["url"].rstrip("/")
         if key not in deduped:
             deduped[key] = item
         else:
-            # Keep the richer snippet if providers returned the same page.
             if len(item.get("content", "")) > len(deduped[key].get("content", "")):
                 deduped[key] = item
 
@@ -2097,8 +1987,6 @@ def _extract_numeric_evidence_ledger(evidence):
     ledger = []
     for source_index, item in enumerate(evidence, start=1):
         content = str(item.get("content", ""))
-        # Sentence splitting is intentionally conservative; keep the full
-        # sentence so the metric/object remains attached to the number.
         sentences = re.split(r"(?<=[.!?])\s+", content)
         for sentence in sentences:
             sentence = re.sub(r"\s+", " ", sentence).strip()
@@ -2111,14 +1999,12 @@ def _extract_numeric_evidence_ledger(evidence):
                 return "\n".join(ledger)
     return "\n".join(ledger)
 
-
 def _answer_has_numeric_claim(answer):
     return bool(re.search(
         r"(?:\$\s?\d|\d[\d,.]*\s?%|\b\d[\d,.]*\s?(?:million|billion|trillion|M|B|K)\b|\b\d{4}\b)",
         answer or "",
         flags=re.I,
     ))
-
 
 def _validate_answer_numeric_claims(answer, evidence, ledger):
     """Conservatively validate numeric claims before showing them to the user.
@@ -2151,10 +2037,7 @@ def _validate_answer_numeric_claims(answer, evidence, ledger):
         if norm_number(number) not in normalized_evidence:
             return False
 
-    # The ledger must exist whenever a numeric claim is made. It gives the
-    # verifier the exact source sentence containing the number and its metric.
     return bool(ledger.strip())
-
 
 _NUMERIC_CLAIM_RE = re.compile(
     r"(?:\$\s?\d[\d,.]*(?:\s?(?:million|billion|trillion|M|B|K))?|"
@@ -2177,14 +2060,12 @@ def _meaningful_words(text):
     words = re.findall(r"[a-z0-9]+", str(text).lower())
     return {w for w in words if w not in _NUMERIC_STOPWORDS and not w.isdigit() and len(w) >= 3}
 
-
 def _number_variants(value):
     value = str(value).lower().replace(" ", "")
     variants = {value}
     if value.endswith("%"):
         variants.add(value[:-1])
     return variants
-
 
 def _source_sentences_for_number(number, evidence):
     matches = []
@@ -2197,7 +2078,6 @@ def _source_sentences_for_number(number, evidence):
             if any(v in compact for v in variants):
                 matches.append((source_index, sentence))
     return matches
-
 
 def _validate_numeric_metric_pairings(answer, evidence):
     """Deterministically check that each answer number stays attached to its source metric."""
@@ -2228,8 +2108,6 @@ def _validate_numeric_metric_pairings(answer, evidence):
                     best_overlap = overlap
                     best_sentence = source_sentence
 
-            # A numeric claim must share at least two meaningful metric words
-            # or a strong lexical overlap with the exact source sentence.
             if best_overlap < 0.34:
                 return False, (
                     f"Number {number} is present in the sources, but the answer "
@@ -2238,14 +2116,12 @@ def _validate_numeric_metric_pairings(answer, evidence):
 
     return True, ""
 
-
 def _numeric_definition_summary(evidence):
     """Provide the model with the exact sentence-level meaning of each number."""
     ledger = _extract_numeric_evidence_ledger(evidence)
     if not ledger:
         return "No numeric evidence found. Do not invent statistics."
     return ledger
-
 
 def _verify_and_rewrite_web_answer(answer, user_message, evidence, ledger):
     """Use the stronger grounding model only after deterministic metric checks."""
@@ -2303,7 +2179,6 @@ DRAFT ANSWER:
     except Exception:
         pass
     return answer
-
 
 def _call_web_direct(user_message):
     """Search public web pages and return an evidence-grounded answer."""
@@ -2392,8 +2267,6 @@ Return only the answer with inline [S#] citations.
 
     numeric_ok, numeric_reason = _validate_numeric_metric_pairings(answer, evidence)
     if not numeric_ok:
-        # One final rewrite is allowed. If it still fails deterministic validation,
-        # do not display a potentially misleading statistic.
         retry_prompt = f"""
 Correct the answer below using ONLY the exact numeric evidence.
 
@@ -2431,7 +2304,6 @@ ANSWER:
             pass
 
     if not numeric_ok:
-        # Safe fallback: no fabricated statistic.
         answer = (
             "I couldn't verify the exact meaning of the numeric figure from the "
             "retrieved sources without risking attaching it to the wrong metric. "
@@ -2441,9 +2313,7 @@ ANSWER:
 
     return answer, {"web_evidence": evidence}, evidence
 
-
 def get_chat_response(user_message):
-    # Keep the request small enough for the API even after RAG context is added.
     user_message = str(user_message).strip()[:4000]
     recent_messages = st.session_state.messages[-6:]
 
@@ -2473,8 +2343,6 @@ def get_chat_response(user_message):
         st.session_state.last_rag_topic = None
         st.session_state.last_rag_sources = []
 
-    # BBDU remains strictly official-RAG-only. Other topics can use web search
-    # when current information is explicitly needed or Web Search is enabled.
     needs_web = (
         st.session_state.web_search
         and is_current_information_question(user_message)
@@ -2523,7 +2391,6 @@ def prepare_image_for_vision(image_bytes, image_mime):
     if not image_bytes:
         raise ValueError("The uploaded image is empty.")
 
-    # Small files can be sent without recompression.
     if len(image_bytes) <= MAX_IMAGE_API_BYTES:
         return image_bytes, image_mime or "image/jpeg"
 
@@ -2531,15 +2398,12 @@ def prepare_image_for_vision(image_bytes, image_mime):
         image = Image.open(io.BytesIO(image_bytes))
         image.load()
 
-        # Preserve screenshots/photos while converting unsupported modes to RGB.
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGB")
 
-        # Start with a reasonable resolution for OCR and screenshots.
         image.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
         image = image.convert("RGB")
 
-        # Repeatedly compress, then reduce dimensions if necessary.
         dimensions = [
             (2200, 2200),
             (1900, 1900),
@@ -2580,190 +2444,120 @@ def prepare_image_for_vision(image_bytes, image_mime):
             f"Could not prepare the image for analysis: {error}"
         ) from error
 
-
-@st.cache_resource(show_spinner=False)
-def _get_accessible_vision_models():
-    """
-    Discover which supported Groq vision models are actually available to
-    the current API key/project.
-    """
+def _call_vision_model(messages_for_ai):
+    """Call Groq vision with a safe output budget and one lower-budget retry."""
     try:
-        model_page = client.models.list()
-        available_ids = {
-            str(getattr(model, "id", "")).strip()
-            for model in getattr(model_page, "data", [])
-        }
-        discovered = [
-            model_id
-            for model_id in VISION_MODEL_CANDIDATES
-            if model_id in available_ids
-        ]
-        if discovered:
-            return discovered
-    except Exception:
-        # If model listing is unavailable, try the known current candidates
-        # directly. The actual request remains the final authority.
-        pass
+        return client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=messages_for_ai,
+            max_completion_tokens=700,
+            reasoning_effort="none",
+            temperature=0.2,
+        )
+    except Exception as first_error:
+        error_text = str(first_error).lower()
 
-    return list(VISION_MODEL_CANDIDATES)
-
-
-def _is_model_not_found_error(error):
-    """Return True for Groq errors indicating the selected model is unavailable."""
-    error_text = str(error).lower()
-    return (
-        "model_not_found" in error_text
-        or "model not found" in error_text
-        or ("404" in error_text and "model" in error_text)
-        or "does not exist or you do not have access" in error_text
-    )
-
-
-def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
-    """Call the current Groq vision model with a configurable output budget."""
-    candidate_models = _get_accessible_vision_models()
-    last_model_error = None
-
-    for model_id in candidate_models:
-        try:
-            return client.chat.completions.create(
-                model=model_id,
-                messages=messages_for_ai,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_effort="none",
-                temperature=0.2,
-            )
-        except Exception as first_error:
-            error_text = str(first_error).lower()
-
-            if _is_model_not_found_error(first_error):
-                last_model_error = first_error
-                continue
-
-            # If Groq reports an output-token-per-minute limit, retry with a
-            # smaller budget rather than failing the whole image request.
-            is_otpm_limit = (
-                "429" in error_text
-                and (
-                    "output tokens per minute" in error_text
-                    or "otpm" in error_text
-                    or ("requested" in error_text and "tokens" in error_text)
+        is_otpm_limit = (
+            "429" in error_text
+            and (
+                "output tokens per minute" in error_text
+                or "otpm" in error_text
+                or (
+                    "requested" in error_text
+                    and "tokens" in error_text
                 )
             )
-            if is_otpm_limit:
-                # Groq may expose retry-after on the SDK exception response.
-                retry_after = 2.0
-                try:
-                    headers = getattr(getattr(first_error, "response", None), "headers", {}) or {}
-                    retry_after = float(headers.get("retry-after", retry_after))
-                except Exception:
-                    pass
-                time.sleep(min(max(retry_after, 1.0), 15.0))
-                retry_budget = min(max_completion_tokens, 1200)
-                try:
-                    return client.chat.completions.create(
-                        model=model_id,
-                        messages=messages_for_ai,
-                        max_completion_tokens=retry_budget,
-                        reasoning_effort="none",
-                        temperature=0.2,
-                    )
-                except Exception as retry_error:
-                    if _is_model_not_found_error(retry_error):
-                        last_model_error = retry_error
-                        continue
-                    raise
+        )
 
+        if not is_otpm_limit:
             raise
 
-    raise RuntimeError(
-        "No supported Groq vision model is accessible with the current "
-        "GROQ_API_KEY/project. The app uses Groq's current Qwen 3.8 27B "
-        "vision model. Check that the Streamlit Cloud GROQ_API_KEY is active "
-        "and has access to this model."
-    ) from last_model_error
+        time.sleep(0.8)
 
+        return client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=messages_for_ai,
+            max_completion_tokens=450,
+            reasoning_effort="none",
+            temperature=0.2,
+        )
 
-def _build_vision_messages(user_message, image_infos, rag_context, rag_topic, bounded_messages, evidence_only=False):
-    """Build one Groq vision request for the supplied image batch."""
+def get_image_chat_response(user_message, uploaded_images):
+    """Analyze up to five uploaded images with Groq's Qwen vision model, with special handling for code debugging."""
+
+    user_message = str(user_message).strip()[:4000]
+
+    if not uploaded_images:
+        raise ValueError("No image was uploaded.")
+
+    if len(uploaded_images) > MAX_IMAGES_PER_REQUEST:
+        raise ValueError(f"A maximum of {MAX_IMAGES_PER_REQUEST} images can be analyzed at once.")
+
+    recent_messages = st.session_state.messages[:-1][-6:]
+    bounded_messages = []
+
+    for message in recent_messages:
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(message.get("content", ""))[:1500]
+        if content:
+            bounded_messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
+
+    rag_topic = detect_rag_topic(user_message)
+    rag_context = ""
+    rag_sources = []
+
+    if rag_topic:
+        rag_context, rag_sources = retrieve_trusted_context(
+            user_message,
+            rag_topic,
+            top_k=3,
+        )
+        st.session_state.last_rag_topic = rag_topic
+        st.session_state.last_rag_sources = rag_sources
+    else:
+        st.session_state.last_rag_topic = None
+        st.session_state.last_rag_sources = []
+
     vision_rules = """
 IMAGE / CODE DEBUGGING MODE
 
 You are Adarsh AI's visual analysis and code-debugging assistant.
-The user has explicitly asked a question about the uploaded image(s).
-Your first responsibility is to answer THAT question from the visible image evidence.
-Do not start with a generic description of the image and do not discuss unrelated
-visible objects, people, text, buttons, dates, or UI elements unless they help answer
-the user's question.
+You can analyze and explain uploaded images, but this application does NOT provide an image-generation or pixel-level image-editing API.
+Never claim that an edited/generated image was actually created. If the user asks for an image edit, explain the requested edit clearly and say that Adarsh AI can analyze the image and provide editing instructions, but cannot render the edited image in this app.
 
-STRICT VISUAL GROUNDING
-1. Use only what is actually visible/readable in the uploaded image(s).
-2. Never invent text, numbers, errors, people, objects, or details that are not visible.
-3. If something is blurry, cropped, hidden, or unreadable, say so.
-4. If multiple images are supplied, compare/correlate them when relevant and refer to
-   them as Image 1, Image 2, Image 3, Image 4, and Image 5.
-5. Ignore irrelevant visual information. If the user asks about an error, focus on the
-   error and evidence needed to explain/fix it; do not describe unrelated UI.
+The uploaded image(s) may contain a programming code screenshot, terminal/compiler error, stack trace, SQL query, IDE screen, document, diagram, table, or ordinary photo.
 
-RESPONSE ORDER
-Always follow this order:
-### Answer to Your Question
-Answer the user's exact request first. If the uploaded image contains a numbered
-assignment/question sheet and the user asks to answer it, identify EVERY visible
-numbered question and answer EVERY one in order. Never stop after the first few
-questions merely because the response is long. Do not omit a question that is clearly
-readable. Preserve the question numbering (Ques-1, Ques-2, etc.).
-
-For multi-question assignments:
-- Give a separate heading for each question.
-- Give a complete, study-ready answer, not a one-line definition.
-- Use enough detail to explain the concept clearly, normally about 150-300 words
-  per question when the image and user request support that level of detail.
-- Include definitions, key points, examples, differences, steps, or strategies when
-  they are directly relevant to that question.
-- Do not pad answers with unrelated information just to increase length.
-- If a question is partially unreadable, state that specific limitation instead of
-  inventing the missing wording.
-
-### Image Summary
-After ALL requested questions have been answered, give a short summary of only the
-image evidence relevant to the user's request. Do NOT turn this into a generic image
-description.
+GENERAL IMAGE RULES
+1. Answer the user's exact question.
+2. Describe only information that is actually visible.
+3. Never invent text, numbers, errors, people, objects, or details that are not readable/visible.
+4. If something is blurry, cropped, hidden, or unreadable, explicitly say so.
+5. If multiple images are supplied, analyze all of them and refer to them as Image 1, Image 2, Image 3, Image 4, and Image 5 as applicable.
 
 CODE DEBUGGING RULES
-When the image contains source code, compiler output, terminal output, stack traces,
-logs, SQL, configuration, or an IDE:
-1. Identify the language when possible.
-2. Read visible error messages accurately and distinguish errors from warnings.
-3. Locate the problematic line/section when visible.
+When the image contains source code, compiler output, terminal output, stack traces, logs, SQL, configuration, or an IDE:
+1. Identify the programming language when possible.
+2. Read the visible error message exactly and distinguish errors from warnings.
+3. Locate the problematic line or section when visible.
 4. Explain the root cause in simple language.
 5. Preserve the user's intended logic; do not unnecessarily rewrite working code.
-6. Reconstruct complete corrected code when enough code is visible.
-7. Check syntax, brackets, quotes, variable names, types, method signatures, imports,
-   and obvious compile/runtime issues before presenting a correction.
-8. If multiple screenshots contain related code/error output, correlate them before
-   deciding the fix.
-9. Never claim the code was executed or verified unless it was actually executed.
-10. If the screenshot lacks enough context for a safe complete correction, say what is
-    missing instead of inventing it.
-11. If the user asks for error-free code, provide the best correction possible and say
-    it should be run/tested in their environment; do not falsely guarantee execution.
+6. Reconstruct COMPLETE corrected code when enough code is visible. Include required imports and preserve class/file structure when visible.
+7. Check syntax, brackets, quotes, variable names, types, method signatures, imports, and obvious compile/runtime issues before presenting the correction.
+8. If multiple screenshots contain related code/error output, correlate them before deciding the fix.
+9. Never claim the code was executed or verified unless you actually executed it.
+10. If the screenshot does not contain enough code/context to safely produce a complete correction, clearly state what is missing and provide the safest targeted fix instead of inventing missing code.
+11. If the user asks for “error-free code”, provide the best corrected complete code possible and clearly say it should be run/tested in their environment; do not falsely guarantee execution.
 
-If the image is not a code/debugging screenshot, answer naturally and only discuss what
-is relevant to the user's question.
-"""
+PREFERRED CODE-DEBUGGING RESPONSE FORMAT
 
-    if evidence_only:
-        vision_rules += """
-
-BATCH EVIDENCE MODE
-This is an internal evidence pass because the user uploaded more images than one
-vision request can safely contain. Do NOT give a generic image description.
-Read and preserve every visible numbered question, important definition, table,
-error, code line, or other evidence needed to answer the user's exact request.
-Keep the evidence concise but complete enough that a later synthesis step can answer
-EVERY question without losing question numbers or important wording. Label image
-numbers where useful. Do not speculate.
+If the image is not a code/debugging screenshot, do not force the code format. Answer naturally based on what is visible.
 """
 
     messages_for_ai = [
@@ -2784,7 +2578,7 @@ numbers where useful. Do not speculate.
     total_prepared_bytes = 0
     prepared_count = 0
 
-    for index, image_info in image_infos:
+    for index, image_info in enumerate(uploaded_images[:MAX_IMAGES_PER_REQUEST], start=1):
         image_bytes = image_info["bytes"]
         image_mime = image_info["mime"] or "image/jpeg"
         image_name = image_info["name"]
@@ -2801,8 +2595,8 @@ numbers where useful. Do not speculate.
 
         if total_prepared_bytes + len(prepared_bytes) > MAX_TOTAL_IMAGE_API_BYTES:
             raise ValueError(
-                "The combined image payload for this analysis batch is too large. "
-                "Please upload smaller images."
+                "The combined image payload is too large for a safe request. "
+                "Please upload smaller images or fewer images."
             )
 
         total_prepared_bytes += len(prepared_bytes)
@@ -2835,208 +2629,24 @@ numbers where useful. Do not speculate.
             "content": multimodal_content,
         }
     )
-    return messages_for_ai
-
-
-def _is_image_count_limit_error(error):
-    """Detect a vision-model error caused by too many images in one request."""
-    text = str(error).lower()
-    return (
-        "maximum" in text and "image" in text
-        or "max" in text and "image" in text
-        or "too many images" in text
-        or "3 images" in text
-        or "image limit" in text
-    )
-
-
-def _synthesize_multi_batch_image_answer(user_message, evidence_parts):
-    """Synthesize batched visual evidence into a complete, ordered answer."""
-    evidence_text = "\n\n".join(evidence_parts)
-    synthesis_prompt = f"""
-You are the final answer writer for Adarsh AI. The user uploaded up to five images,
-and the visual evidence below was collected in batches.
-
-USER REQUEST:
-{user_message[:4000]}
-
-VISUAL EVIDENCE:
-{evidence_text[:16000]}
-
-MANDATORY RULES:
-1. Answer the user's exact request first.
-2. If the images contain a numbered question/assignment sheet, identify every
-   visible question and answer EVERY question in numerical order. Never skip a
-   readable question because the response is long.
-3. Preserve the original question numbering and wording as closely as the evidence
-   allows (for example, Ques-1 through Ques-6).
-4. Each answer must be complete and study-ready. Give definitions, explanations,
-   key points, examples, comparisons, steps, or strategies where directly relevant.
-5. Aim for roughly 150-300 words per assignment question when the source and user
-   request support that detail. Do not add irrelevant filler.
-6. Use ONLY the supplied visual evidence. Do not invent missing question text or facts.
-7. If a specific part of a question is unreadable, say exactly which part is unclear.
-8. After all questions are answered, include:
-
-### Image Summary
-Only summarize image details that are relevant to the user's request.
-9. Do not describe unrelated UI, phone status bars, logos, dates, or other visible
-   elements unless they matter to the user's question.
-
-Return a polished answer suitable for submitting as study/assignment notes.
-"""
-
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are Adarsh AI's final visual-answer writer. "
-                    "Complete every requested numbered question using only the supplied evidence."
-                ),
-            },
-            {"role": "user", "content": synthesis_prompt},
-        ],
-        reasoning_effort="low",
-        max_completion_tokens=3500,
-    )
-    answer = str(response.choices[0].message.content or "").strip()
-    if not answer:
-        raise RuntimeError("The multi-image synthesis returned an empty response.")
-    return answer, response
-
-
-def get_image_chat_response(user_message, uploaded_images):
-    """Answer the user's prompt from up to five uploaded images."""
-    user_message = str(user_message).strip()[:4000]
-
-    if not uploaded_images:
-        raise ValueError("No image was uploaded.")
-
-    if len(uploaded_images) > MAX_IMAGES_PER_REQUEST:
-        raise ValueError(
-            f"A maximum of {MAX_IMAGES_PER_REQUEST} images can be analyzed at once."
-        )
-
-    recent_messages = st.session_state.messages[:-1][-6:]
-    bounded_messages = []
-    for message in recent_messages:
-        role = message.get("role")
-        if role not in ("user", "assistant"):
-            continue
-        content = str(message.get("content", ""))[:1500]
-        if content:
-            bounded_messages.append({"role": role, "content": content})
-
-    rag_topic = detect_rag_topic(user_message)
-    rag_context = ""
-    rag_sources = []
-
-    if rag_topic:
-        rag_context, rag_sources = retrieve_trusted_context(
-            user_message,
-            rag_topic,
-            top_k=3,
-        )
-        st.session_state.last_rag_topic = rag_topic
-        st.session_state.last_rag_sources = rag_sources
-    else:
-        st.session_state.last_rag_topic = None
-        st.session_state.last_rag_sources = []
-
-    indexed_images = list(enumerate(uploaded_images, start=1))
-
-    # Current Qwen 3.8 accepts at most 3 images/request. For 4-5 images,
-    # batch as 3+2 immediately instead of making a failed 5-image request.
-    if len(indexed_images) > 3:
-        evidence_parts = []
-        for batch_start in range(0, len(indexed_images), 3):
-            batch = indexed_images[batch_start:batch_start + 3]
-            batch_messages = _build_vision_messages(
-                user_message,
-                batch,
-                rag_context,
-                rag_topic,
-                [],
-                evidence_only=True,
-            )
-            try:
-                batch_response = _call_vision_model(
-                    batch_messages,
-                    max_completion_tokens=1600,
-                )
-            except Exception as batch_error:
-                raise RuntimeError(
-                    f"Groq vision request failed while analyzing image batch "
-                    f"{batch[0][0]}-{batch[-1][0]}: {batch_error}"
-                ) from batch_error
-
-            batch_answer = str(batch_response.choices[0].message.content or "").strip()
-            if batch_answer:
-                evidence_parts.append(
-                    f"Images {batch[0][0]}-{batch[-1][0]} evidence:\n{batch_answer}"
-                )
-
-            # Avoid immediately stacking another Qwen request into the same
-            # token window on rate-limited Groq developer keys.
-            if batch_start + 3 < len(indexed_images):
-                time.sleep(2.5)
-
-        if not evidence_parts:
-            raise RuntimeError("No usable visual evidence was returned from the uploaded images.")
-
-        try:
-            answer, synthesis_response = _synthesize_multi_batch_image_answer(
-                user_message,
-                evidence_parts,
-            )
-        except Exception as synthesis_error:
-            raise RuntimeError(
-                f"Visual evidence was collected, but the final answer could not be synthesized: {synthesis_error}"
-            ) from synthesis_error
-
-        return (
-            clean_answer_for_display(answer),
-            synthesis_response,
-            rag_sources,
-            rag_topic,
-        )
-
-    # For one image, allow a large enough response for multi-question assignments.
-    # For two/three images, keep the budget conservative enough for Groq TPM limits.
-    output_budget = 3500 if len(indexed_images) == 1 else 2000
 
     try:
-        messages_for_ai = _build_vision_messages(
-            user_message,
-            indexed_images,
-            rag_context,
-            rag_topic,
-            bounded_messages,
-            evidence_only=False,
-        )
-        response = _call_vision_model(
-            messages_for_ai,
-            max_completion_tokens=output_budget,
-        )
-        answer = response.choices[0].message.content or ""
-        if not answer.strip():
-            raise RuntimeError(
-                "Groq vision returned an empty response. Please retry the image request."
-            )
-        return (
-            clean_answer_for_display(answer),
-            response,
-            rag_sources,
-            rag_topic,
-        )
+        response = _call_vision_model(messages_for_ai)
+    except Exception as error:
+        raise RuntimeError(f"Groq vision request failed: {error}") from error
 
-    except Exception as direct_error:
+    answer = response.choices[0].message.content or ""
+    if not answer.strip():
         raise RuntimeError(
-            f"Groq vision request failed: {direct_error}"
-        ) from direct_error
+            "Groq vision returned an empty response. Please retry the image request."
+        )
 
+    return (
+        clean_answer_for_display(answer),
+        response,
+        rag_sources,
+        rag_topic,
+    )
 
 def extract_sources(response):
     """Extract displayed web sources from direct-web or Compound responses."""
@@ -3053,11 +2663,6 @@ def extract_sources(response):
         for item in evidence[:WEB_MAX_SOURCE_LINKS]
     ]
 
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
 with st.sidebar:
 
     if st.session_state.user_profile:
@@ -3073,10 +2678,6 @@ with st.sidebar:
         st.caption("🗄️ MySQL history: Connected")
 
     st.divider()
-
-    # -----------------------------------------------------
-    # PROFILE / ACCOUNT
-    # -----------------------------------------------------
 
     with st.expander("👤 Account", expanded=False):
 
@@ -3102,6 +2703,8 @@ with st.sidebar:
                 st.session_state.active_chat_id = None
                 st.session_state.messages = []
                 st.session_state.chat_history = []
+                st.session_state.uploaded_images = []
+                st.session_state.image_uploader_version += 1
                 st.session_state.show_login = True
                 st.rerun()
 
@@ -3117,10 +2720,6 @@ with st.sidebar:
             ):
                 st.session_state.show_login = True
                 st.rerun()
-
-    # -----------------------------------------------------
-    # LOGIN / ACCOUNT FORM
-    # -----------------------------------------------------
 
     if (
         st.session_state.show_login
@@ -3226,20 +2825,12 @@ with st.sidebar:
 
     st.divider()
 
-    # -----------------------------------------------------
-    # NEW CHAT
-    # -----------------------------------------------------
-
     if st.button(
         "➕ New Chat",
         use_container_width=True,
     ):
         start_new_chat()
         st.rerun()
-
-    # -----------------------------------------------------
-    # CHAT HISTORY
-    # -----------------------------------------------------
 
     st.markdown("### 💬 Chat History")
 
@@ -3286,6 +2877,8 @@ with st.sidebar:
                         chat["messages"].copy()
                     )
                     st.session_state.active_chat_id = chat["id"]
+                    st.session_state.uploaded_images = []
+                    st.session_state.image_uploader_version += 1
 
                     st.rerun()
 
@@ -3325,10 +2918,6 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-
-    # -----------------------------------------------------
-    # SETTINGS
-    # -----------------------------------------------------
 
     with st.expander("⚙️ Settings", expanded=False):
 
@@ -3376,10 +2965,6 @@ with st.sidebar:
             "native theme and your device/browser preference. "
             "The app does not inject custom HTML/CSS."
         )
-
-    # -----------------------------------------------------
-    # HELP & SUPPORT
-    # -----------------------------------------------------
 
     if feedback_available:
 
@@ -3449,138 +3034,116 @@ with st.sidebar:
     st.caption("Adarsh Dixit")
     st.caption("BCA • Data Science & AI")
 
-
-# =========================================================
-# MAIN CONTENT
-# =========================================================
-
 if st.session_state.user_profile:
 
     name = st.session_state.user_profile["name"]
 
     if not st.session_state.messages:
 
-        st.markdown(f"# 🤖 Hi {name}!")
-        st.caption("Your Personal AI Assistant")
+        st.markdown(
+            f"# 🤖 Hi {name}!"
+        )
 
         st.markdown(
-            "Ask anything, learn step-by-step, solve coding problems, "
-            "or get help with current information."
+            "### Your Personal AI Assistant"
+        )
+
+        st.caption(
+            "Ask a question and get a clear, organized answer."
         )
 
         st.divider()
-
-        # -------------------------------------------------
-        # WELCOME / CAPABILITY CARDS
-        # -------------------------------------------------
 
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            with st.container(border=True):
-                st.markdown("### 📚 Learn")
-                st.caption(
-                    "Understand concepts in simple language with "
-                    "examples and step-by-step explanations."
-                )
+            st.info(
+                "**📚 Learn**\n\n"
+                "Simple definitions, key points and examples."
+            )
 
         with col2:
-            with st.container(border=True):
-                st.markdown("### 💻 Build")
-                st.caption(
-                    "Get help with Java, Python, React, SQL, "
-                    "Spring Boot and other technical problems."
-                )
+            st.info(
+                "**💻 Code**\n\n"
+                "Simple solutions with useful explanations."
+            )
 
         with col3:
-            with st.container(border=True):
-                st.markdown("### 🖼️ Analyze")
-                st.caption(
-                    "Attach up to 5 images and ask a specific "
-                    "question about what you want to understand."
-                )
+            st.info(
+                "**🌐 Current Info**\n\n"
+                "Search current information when needed."
+            )
 
         st.divider()
 
-        with st.container(border=True):
-            st.markdown("### ✨ Ready when you are")
-            st.caption(
-                "Type your question below. You can also attach images "
-                "when your question depends on visual information."
-            )
+        st.markdown("### 💡 Try asking")
 
-        st.caption(
-            "🔒 Your saved chats are available from the sidebar when you are logged in."
+        st.write(
+            "• What is inheritance in Java?"
+        )
+        st.write(
+            "• Explain matrices for 4 marks."
+        )
+        st.write(
+            "• Write a simple Python program to reverse a string."
         )
 
     else:
 
-        st.markdown("# 🤖 Adarsh AI")
+        st.markdown(
+            "# 🤖 Adarsh AI"
+        )
+
         st.caption(
-            "Clear answers • Simple explanations • Focused assistance"
+            "Clear answers. Simple explanations. No unnecessary information."
         )
 
 else:
 
     st.markdown("# 🤖 Adarsh AI")
-    st.caption("Your Personal AI Assistant")
 
     st.markdown(
-        "Learn, build, solve problems and explore ideas with clear, "
-        "organized answers."
+        "### Your Personal AI Assistant"
+    )
+
+    st.caption(
+        "Ask questions • Learn • Explore • Get answers"
     )
 
     st.divider()
 
-    with st.container(border=True):
-        st.markdown("### 👋 Welcome to Adarsh AI")
-        st.write(
-            "Ask about programming, mathematics, technology, "
-            "Artificial Intelligence, Data Science or everyday questions."
-        )
-
-        st.caption(
-            "You can also attach up to 5 images and ask a question "
-            "about the information you need from them."
-        )
-
-    st.write("")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        with st.container(border=True):
-            st.markdown("### 🧠 Understand")
-            st.caption(
-                "Get beginner-friendly explanations, examples and "
-                "step-by-step guidance."
-            )
-
-    with col2:
-        with st.container(border=True):
-            st.markdown("### 🛠️ Create")
-            st.caption(
-                "Work through code, debugging, SQL, React, Java, "
-                "Spring Boot and technical questions."
-            )
-
-    st.write("")
-
-    with st.container(border=True):
-        st.markdown("### 🔐 Save your conversations")
-        st.caption(
-            "Create an account from the sidebar using your Name, "
-            "Date of Birth and Gender to save and restore chat history."
-        )
-
-    st.info(
-        "💬 Start by typing your question in the message box below."
+    st.markdown(
+        "## 👋 Welcome"
     )
 
+    st.write(
+        "Ask me about programming, mathematics, technology, "
+        "Artificial Intelligence, Data Science or everyday questions."
+    )
 
-# =========================================================
-# SOURCE LINKS
-# =========================================================
+    st.info(
+        "👤 Create a profile from the sidebar if you want "
+        "a personalized experience."
+    )
+
+    st.markdown("### 💡 Try these questions")
+
+    quick_questions = [
+        "Explain Java in simple words with a real-world example.",
+        "What is the difference between JDK, JRE and JVM?",
+        "Explain Spring Boot and why we use it.",
+        "What is React and how does the Virtual DOM work?",
+        "Explain SQL JOINs with simple examples.",
+        "What is Generative AI and how does it work?",
+    ]
+
+    question_columns = st.columns(2)
+
+    for index, question in enumerate(quick_questions):
+        with question_columns[index % 2]:
+            st.code(question, language="text")
+
+    st.caption("📋 Click the copy icon on any question to copy it in one click.")
 
 def render_source_links(rag_sources=None, web_sources=None):
     """Show compact clickable source links directly below the answer."""
@@ -3605,11 +3168,6 @@ def render_source_links(rag_sources=None, web_sources=None):
     st.markdown(
         "**📚 Sources:** " + "  ·  ".join(links)
     )
-
-
-# =========================================================
-# RENDER EXISTING CHAT
-# =========================================================
 
 for message in st.session_state.messages:
 
@@ -3646,111 +3204,87 @@ for message in st.session_state.messages:
                 message.get("web_sources", []),
             )
 
-            # --- BUG FIX: Updated to small Copy Icon Popover ---
             with st.popover("📋", help="Copy answer"):
                 st.code(
                     message["content"],
                     language="markdown",
                 )
 
-
-# =========================================================
-# CHAT INPUT + IMAGE ATTACHMENTS
-# =========================================================
-#
-# Uses Streamlit's native chat_input with built-in file attachments.
-# Current Streamlit supports multiple file attachments in the chat input
-# and supports pasting files/images directly into st.chat_input.
-#
-# Supported:
-#   • attachment button inside the typing bar
-#   • gallery/file picker on desktop and mobile
-#   • Ctrl+V / Cmd+V image paste from clipboard
-#   • up to 5 images per message (validated server-side)
-#   • image analysis starts ONLY after the user submits a text prompt
-#   • no separate uploader above the chat box
-# =========================================================
-
 if st.session_state.user_profile is None:
     st.caption(
         "🔐 Login with your Name + Date of Birth to save and restore chat history."
     )
 
-chat_submission = st.chat_input(
-    "Ask Adarsh AI anything…",
-    key="adarsh_ai_chat_prompt",
-    accept_file="multiple",
-    file_type=["png", "jpg", "jpeg", "webp"],
-    max_upload_size=20,
-    disabled=False,
-)
+if st.session_state.uploaded_images:
+    st.caption(
+        f"📎 {len(st.session_state.uploaded_images)} image(s) currently attached. "
+        f"Maximum {MAX_IMAGES_PER_REQUEST} images per request."
+    )
 
-user_message = ""
+uploader_key = f"image_uploader_{st.session_state.image_uploader_version}"
+
+with st.popover("➕ Attach Image", help="Click to select from gallery or Paste an image here"):
+    uploaded_files = st.file_uploader(
+        "Upload or Paste Image(s)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key=uploader_key,
+        label_visibility="collapsed"
+    )
+
+    if uploaded_files:
+        if st.button("🗑️ Clear Attachment", key=f"clear_attachment_{st.session_state.image_uploader_version}", use_container_width=True):
+            st.session_state.uploaded_images = []
+            st.session_state.image_uploader_version += 1
+            st.rerun()
+
 submitted_images = []
 
-if chat_submission is not None:
-    user_message = str(getattr(chat_submission, "text", "") or "").strip()
-
-    uploaded_files = list(getattr(chat_submission, "files", []) or [])
-
-    # Hard server-side limit: never send more than five images.
+if uploaded_files:
     if len(uploaded_files) > MAX_IMAGES_PER_REQUEST:
         st.error(
-            f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message. "
-            f"You selected {len(uploaded_files)}. Please send up to {MAX_IMAGES_PER_REQUEST} images at a time."
+            f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message."
         )
-        uploaded_files = uploaded_files[:MAX_IMAGES_PER_REQUEST]
-        user_message = ""
-
-    for index, uploaded_file in enumerate(uploaded_files, start=1):
-        try:
+    else:
+        for uploaded_file in uploaded_files:
             image_bytes = uploaded_file.getvalue()
-            image_type = str(getattr(uploaded_file, "type", "") or "image/png").strip()
-            image_name = str(getattr(uploaded_file, "name", "") or f"image_{index}.png")
-
-            if not image_bytes:
-                continue
 
             if len(image_bytes) > MAX_IMAGE_SIZE_BYTES:
                 st.error(
-                    f"❌ Image {index} is larger than "
-                    f"{MAX_IMAGE_SIZE_BYTES // (1024 * 1024)} MB."
+                    f"❌ {uploaded_file.name} is larger than 20 MB. "
+                    "Please choose a smaller screenshot/image."
                 )
                 continue
 
             submitted_images.append(
                 {
                     "bytes": image_bytes,
-                    "mime": image_type,
-                    "name": image_name,
+                    "mime": uploaded_file.type or "image/jpeg",
+                    "name": uploaded_file.name,
                 }
             )
 
-        except Exception:
-            st.warning(
-                f"⚠️ Image {index} could not be read. "
-                "Please attach or paste it again."
-            )
+user_message = st.chat_input(
+    "💬 Ask Adarsh AI anything...",
+    key="adarsh_chat_input",
+)
 
-    # An image-only submission must not trigger vision analysis. The user
-    # must explicitly provide a question/prompt first.
-    if submitted_images and not user_message:
-        st.warning(
-            "🖼️ Your image(s) were received, but I need your question first. "
-            "For example: “What is causing this error?”"
-        )
-        submitted_images = []
+user_message = (user_message or "").strip()
 
-# =========================================================
-# PROCESS NEW QUESTION
-# =========================================================
-
-# IMPORTANT: Selecting/uploading an image must NOT call Groq by itself.
-# The image is only an attachment. Vision analysis starts after the user
-# explicitly submits a text prompt through st.chat_input.
-if user_message:
+if user_message or submitted_images:
 
     current_images = list(submitted_images)
+
+    if not user_message and current_images:
+        user_message = (
+            "Analyze the attached image(s). If they contain code or an error, "
+            "identify the error, explain the root cause, and provide the complete "
+            "corrected code when enough context is visible."
+        )
+
+    if current_images:
+        st.session_state.uploaded_images = []
+        st.session_state.image_uploader_version += 1
 
     st.session_state.messages.append(
         {
@@ -3773,12 +3307,10 @@ if user_message:
                 "but this message may not be saved."
             )
 
-    # --- BUG FIX: Immediate UI Render Taaki message hide na ho ---
     with st.chat_message("user", avatar="👤"):
         st.write(user_message)
         if current_images:
             st.caption(f"📎 Attached {len(current_images)} image(s)")
-    # -------------------------------------------------------------
 
     with st.chat_message(
         "assistant",
@@ -3889,7 +3421,6 @@ if user_message:
                 web_sources,
             )
 
-            # --- BUG FIX: Updated to small Copy Icon Popover ---
             with st.popover("📋", help="Copy answer"):
                 st.code(
                     answer,
@@ -3929,19 +3460,6 @@ if user_message:
                         "⏳ The AI service is temporarily rate-limited. "
                         "Please wait a moment and retry."
                     )
-
-            elif has_image and (
-                "no supported groq vision model" in error_text
-                or "model_not_found" in error_text
-                or "model not found" in error_text
-                or "does not exist or you do not have access" in error_text
-            ):
-                friendly_error = (
-                    "🖼️ Groq image analysis is not available for the current API key. "
-                    "The app automatically tried the supported vision models, but "
-                    "this Groq project did not grant access to them. Please update "
-                    "the GROQ_API_KEY in Streamlit Cloud Secrets with an active key."
-                )
 
             elif has_image and (
                 "token" in error_text
@@ -3985,3 +3503,6 @@ if user_message:
                     language="text",
                 )
 
+        finally:
+            st.session_state.uploaded_images = []
+            st.session_state.image_uploader_version += 1
