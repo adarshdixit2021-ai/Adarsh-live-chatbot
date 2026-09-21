@@ -2,6 +2,7 @@ import base64
 import io
 import os
 import re
+import socket
 import time
 import traceback
 from datetime import date, datetime, timedelta
@@ -196,9 +197,10 @@ SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 # The app checks which candidates are accessible to the current API key and
 # automatically falls back if one model returns model_not_found.
 VISION_MODEL_CANDIDATES = (
-    # Current Groq vision model. Qwen 3.8 supports up to 3 images/request;
-    # the app handles 4-5 images through automatic 3+2 batching.
+    # Current Groq vision models. Qwen 3.8 supports up to 3 images/request;
+    # the app handles 4-5 images through automatic batching.
     "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
 )
 VISION_MODEL = VISION_MODEL_CANDIDATES[0]
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
@@ -1086,8 +1088,44 @@ def _set_mysql_error(error):
     st.session_state.mysql_available = False
 
 
+MYSQL_CONNECT_RETRIES = 4
+MYSQL_RETRY_DELAYS = (1.0, 2.0, 4.0, 6.0)
+
+
+def _is_transient_mysql_connection_error(error):
+    """Return True for connection/DNS failures that are reasonable to retry."""
+    if isinstance(error, socket.gaierror):
+        return True
+
+    error_text = str(error or "").lower()
+    transient_markers = (
+        "unknown mysql server host",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "nodename nor servname provided",
+        "getaddrinfo failed",
+        "can't connect to mysql server",
+        "can't connect to mysql server on",
+        "connection timed out",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "server has gone away",
+        "lost connection",
+        "2003",
+        "2005",
+        "2013",
+        "2055",
+    )
+    return any(marker in error_text for marker in transient_markers)
+
+
 def get_mysql_connection():
-    """Create a fresh MySQL connection for local MySQL or a cloud provider such as Aiven."""
+    """
+    Create a fresh MySQL connection with retry handling for transient DNS,
+    network and Aiven connection failures. A fresh connection is intentional
+    because Streamlit reruns the script frequently.
+    """
     if not all([mysql_host, mysql_port, mysql_database, mysql_user, mysql_password]):
         _set_mysql_error(
             "MySQL configuration is incomplete. Required: MYSQL_HOST, "
@@ -1103,36 +1141,54 @@ def get_mysql_connection():
         _set_mysql_error(f"Invalid MySQL port: {error}")
         return None
 
-    try:
-        connection_options = {
-            "host": str(mysql_host).strip(),
-            "port": port,
-            "database": str(mysql_database).strip(),
-            "user": str(mysql_user).strip(),
-            "password": str(mysql_password),
-            "connection_timeout": 10,
-            "autocommit": False,
-            # Aiven requires TLS. For normal Aiven connections the connector
-            # negotiates TLS without requiring a locally downloaded CA file.
-            "ssl_disabled": False,
-            "ssl_verify_cert": mysql_ssl_verify_cert,
-            "ssl_verify_identity": mysql_ssl_verify_identity,
-        }
+    host = str(mysql_host).strip()
+    connection_options = {
+        "host": host,
+        "port": port,
+        "database": str(mysql_database).strip(),
+        "user": str(mysql_user).strip(),
+        "password": str(mysql_password),
+        "connection_timeout": 15,
+        "autocommit": False,
+        # Aiven requires TLS. For normal Aiven connections the connector
+        # negotiates TLS without requiring a locally downloaded CA file.
+        "ssl_disabled": False,
+        "ssl_verify_cert": mysql_ssl_verify_cert,
+        "ssl_verify_identity": mysql_ssl_verify_identity,
+    }
 
-        if mysql_ssl_ca:
-            connection_options["ssl_ca"] = str(mysql_ssl_ca).strip()
-            # When a CA is explicitly supplied, certificate verification is
-            # enabled unless the user deliberately disabled it in config.
-            if "MYSQL_SSL_VERIFY_CERT" not in os.environ:
-                connection_options["ssl_verify_cert"] = True
+    if mysql_ssl_ca:
+        connection_options["ssl_ca"] = str(mysql_ssl_ca).strip()
+        # When a CA is explicitly supplied, certificate verification is
+        # enabled unless the user deliberately disabled it in config.
+        if "MYSQL_SSL_VERIFY_CERT" not in os.environ:
+            connection_options["ssl_verify_cert"] = True
 
-        connection = mysql.connector.connect(**connection_options)
-        st.session_state.mysql_last_error = ""
-        st.session_state.mysql_available = True
-        return connection
-    except Exception as error:
-        _set_mysql_error(f"MySQL connection failed: {error}")
-        return None
+    last_error = None
+
+    for attempt in range(1, MYSQL_CONNECT_RETRIES + 1):
+        try:
+            connection = mysql.connector.connect(**connection_options)
+            st.session_state.mysql_last_error = ""
+            st.session_state.mysql_available = True
+            return connection
+
+        except Exception as error:
+            last_error = error
+
+            # Authentication, database-not-found, permission and TLS
+            # configuration errors are not fixed by repeatedly reconnecting.
+            if not _is_transient_mysql_connection_error(error):
+                break
+
+            if attempt < MYSQL_CONNECT_RETRIES:
+                delay = MYSQL_RETRY_DELAYS[min(attempt - 1, len(MYSQL_RETRY_DELAYS) - 1)]
+                time.sleep(delay)
+
+    _set_mysql_error(
+        f"MySQL connection failed after {MYSQL_CONNECT_RETRIES} attempts: {last_error}"
+    )
+    return None
 
 
 def test_mysql_connection():
@@ -2699,9 +2755,9 @@ def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
 
     raise RuntimeError(
         "No supported Groq vision model is accessible with the current "
-        "GROQ_API_KEY/project. The app uses Groq's current Qwen 3.8 27B "
-        "vision model. Check that the Streamlit Cloud GROQ_API_KEY is active "
-        "and has access to this model."
+        "GROQ_API_KEY/project. The app checks Groq's supported Qwen vision "
+        "models automatically. Check that the Streamlit Cloud GROQ_API_KEY "
+        "is active and has vision-model access."
     ) from last_model_error
 
 
