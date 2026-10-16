@@ -234,7 +234,7 @@ WEB_PAGE_TIMEOUT_SECONDS = 8
 WEB_MAX_PAGE_BYTES = 2_500_000
 WEB_RETRY_DELAY_SECONDS = 0.7
 
-feedback_available = date.today() <= FEEDBACK_END_DATE
+feedback_available = True
 
 # =========================================================
 # RAG / TRUSTED KNOWLEDGE SOURCES
