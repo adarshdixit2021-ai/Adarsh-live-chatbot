@@ -2,7 +2,6 @@ import base64
 import io
 import os
 import re
-import socket
 import time
 import traceback
 from datetime import date, datetime, timedelta
@@ -10,7 +9,9 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, parse_qs, quote_plus
 
 import gspread
-import mysql.connector
+import pymongo
+from pymongo import MongoClient, ReturnDocument
+from bson import ObjectId
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -89,12 +90,12 @@ def _get_secret_value(key, default=None):
     except Exception:
         pass
 
-    # Also support an optional [mysql] section in Streamlit Secrets.
+    # Support optional [mongodb] section in Streamlit Secrets
     try:
-        mysql_section = st.secrets.get("mysql")
-        if mysql_section and key.startswith("MYSQL_"):
-            short_key = key[6:].lower()
-            value = mysql_section.get(short_key)
+        mongo_section = st.secrets.get("mongodb")
+        if mongo_section and key.startswith("MONGODB_"):
+            short_key = key[8:].lower()
+            value = mongo_section.get(short_key)
             if value is not None:
                 return value
     except Exception:
@@ -106,44 +107,21 @@ def _get_secret_value(key, default=None):
 groq_api_key = _clean_config_value(os.getenv("GROQ_API_KEY"))
 google_sheet_id = _clean_config_value(os.getenv("GOOGLE_SHEET_ID"))
 
-# Local development uses .env. Streamlit Cloud uses st.secrets.
-# Environment variables take priority when they contain a real value.
 if not groq_api_key:
     groq_api_key = _clean_config_value(_get_secret_value("GROQ_API_KEY"))
 
 if not google_sheet_id:
     google_sheet_id = _clean_config_value(_get_secret_value("GOOGLE_SHEET_ID"))
 
-mysql_host = _clean_config_value(os.getenv("MYSQL_HOST"))
-mysql_port = _clean_config_value(os.getenv("MYSQL_PORT"), "3306")
-mysql_database = _clean_config_value(os.getenv("MYSQL_DATABASE"))
-mysql_user = _clean_config_value(os.getenv("MYSQL_USER"))
-mysql_password = _clean_config_value(os.getenv("MYSQL_PASSWORD"))
-
-for _mysql_key, _mysql_variable in (
-    ("MYSQL_HOST", "mysql_host"),
-    ("MYSQL_PORT", "mysql_port"),
-    ("MYSQL_DATABASE", "mysql_database"),
-    ("MYSQL_USER", "mysql_user"),
-    ("MYSQL_PASSWORD", "mysql_password"),
-):
-    if not globals().get(_mysql_variable):
-        globals()[_mysql_variable] = _clean_config_value(
-            _get_secret_value(_mysql_key)
-        )
-
-# Aiven requires an encrypted MySQL connection. These optional settings also
-# allow a CA certificate to be supplied later without changing application code.
-mysql_ssl_ca = _clean_config_value(os.getenv("MYSQL_SSL_CA"))
-mysql_ssl_verify_cert = _clean_config_value(
-    os.getenv("MYSQL_SSL_VERIFY_CERT"), "false"
-).lower() in {"1", "true", "yes", "on"}
-mysql_ssl_verify_identity = _clean_config_value(
-    os.getenv("MYSQL_SSL_VERIFY_IDENTITY"), "false"
-).lower() in {"1", "true", "yes", "on"}
-
-if not mysql_ssl_ca:
-    mysql_ssl_ca = _clean_config_value(_get_secret_value("MYSQL_SSL_CA"))
+# MongoDB Atlas (NoSQL) Configuration
+mongodb_uri = _clean_config_value(os.getenv("MONGODB_URI")) or _clean_config_value(
+    _get_secret_value("MONGODB_URI")
+)
+mongodb_database = (
+    _clean_config_value(os.getenv("MONGODB_DATABASE"))
+    or _clean_config_value(_get_secret_value("MONGODB_DATABASE"))
+    or "aether_ad27"
+)
 
 if not groq_api_key:
     st.error(
@@ -172,19 +150,17 @@ defaults = {
     "feedback_sent": False,
     "last_rag_sources": [],
     "last_rag_topic": None,
-    "mysql_user_id": None,
+    "db_user_id": None,
     "active_chat_id": None,
-    "mysql_available": False,
-    "mysql_last_error": "",
+    "db_available": False,
+    "db_last_error": "",
 }
 
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-st.session_state.mysql_available = bool(
-    mysql_host and mysql_database and mysql_user and mysql_password
-)
+st.session_state.db_available = bool(mongodb_uri)
 
 
 # =========================================================
@@ -193,20 +169,13 @@ st.session_state.mysql_available = bool(
 
 SUPPORT_EMAIL = "adarshdixit2021@gmail.com"
 
-# Vision models currently supported by Groq.
-# The app checks which candidates are accessible to the current API key and
-# automatically falls back if one model returns model_not_found.
 VISION_MODEL_CANDIDATES = (
-    # Current Groq vision models. Qwen 3.8 supports up to 3 images/request;
-    # the app handles 4-5 images through automatic batching.
     "qwen/qwen3.8-27b",
     "qwen/qwen3.6-27b",
 )
 VISION_MODEL = VISION_MODEL_CANDIDATES[0]
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
-# User can attach at most five images to one message.
 MAX_IMAGES_PER_REQUEST = 5
-# A single 3-image fallback batch stays below the safe API payload budget.
 MAX_IMAGE_API_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_IMAGE_API_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_DISPLAY_WIDTH = 180
@@ -214,9 +183,6 @@ MAX_IMAGE_DISPLAY_WIDTH = 180
 FEEDBACK_START_DATE = date(2026, 9, 15)
 FEEDBACK_END_DATE = FEEDBACK_START_DATE + timedelta(days=9)
 
-# Web research safeguards. Compound supports multiple tool calls, including
-# web search and website visits, which is preferable for research-heavy
-# current-information questions.
 WEB_EXCLUDE_DOMAINS = [
     "instagram.com",
     "facebook.com",
@@ -585,7 +551,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
 
     if topic == "bbdu":
         candidate_sources = _bbdu_source_priority(question)
-        # For focused BBDU questions, do not waste requests on unrelated pages.
         candidate_sources = candidate_sources[:4]
     else:
         candidate_sources = RAG_SOURCES.get(topic, [])
@@ -597,8 +562,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
         try:
             page_text = fetch_webpage_text(url)
 
-            # Direct evidence snippets are more reliable than relying only on
-            # statistical similarity for facts such as fees and eligibility.
             snippets = _extract_evidence_snippets(
                 page_text,
                 question,
@@ -621,7 +584,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
     if not documents:
         return "", []
 
-    # Lexical relevance is calculated first so short factual evidence wins.
     lexical_scores = []
     for index, document in enumerate(documents):
         doc = _normalise_rag_text(document)
@@ -637,7 +599,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
 
         lexical_scores.append(score)
 
-    # TF-IDF adds semantic-ish ranking without introducing a vector database.
     tfidf_scores = [0.0] * len(documents)
     try:
         vectorizer = TfidfVectorizer(
@@ -675,7 +636,6 @@ def retrieve_trusted_context(question, topic, top_k=3):
         if not chunk:
             continue
 
-        # Hard limit each retrieved chunk.
         chunk = chunk[:1800]
         chunk_key = chunk.lower()
 
@@ -728,8 +688,6 @@ def is_current_information_question(text):
     if any(phrase in text for phrase in current_phrases):
         return True
 
-    # Explicit recent years usually indicate that the user wants current
-    # information rather than static model knowledge.
     for year in ("2025", "2026", "2027"):
         if year in text and any(
             marker in text
@@ -993,13 +951,7 @@ def _build_web_evidence_block(evidence):
 
 
 def _ground_web_answer(user_message, evidence, conversation_messages):
-    """Generate the final answer ONLY from retrieved evidence.
-
-    This is deliberately a separate pass from Compound's own final answer.
-    It prevents the first model from inventing a polished answer that merely
-    looks sourced. The grounding model receives only the user's question,
-    short conversation context, and raw retrieved evidence.
-    """
+    """Generate the final answer ONLY from retrieved evidence."""
     evidence_block = _build_web_evidence_block(evidence)
     if not evidence_block or len(evidence) < WEB_MIN_EVIDENCE_SOURCES:
         return (
@@ -1077,363 +1029,218 @@ Write the final answer now. Use inline [S#] citations for factual claims.
         return ""
     return ""
 
-def _set_mysql_error(error):
-    """Store a safe MySQL diagnostic without exposing credentials."""
+
+# =========================================================
+# MONGODB ATLAS (NoSQL) DATABASE FUNCTIONS
+# =========================================================
+
+def _set_db_error(error):
+    """Store a safe MongoDB diagnostic without exposing credentials."""
     message = str(error or "").strip()
-    # Never display a password if a connector error happens to include it.
-    for secret in (mysql_password, groq_api_key):
+    for secret in (mongodb_uri, groq_api_key):
         if secret:
             message = message.replace(str(secret), "***")
-    st.session_state.mysql_last_error = message[:2000]
-    st.session_state.mysql_available = False
+    # Also mask any password embedded in a mongodb+srv:// string
+    message = re.sub(r"(mongodb(?:\+srv)?://[^:]+:)([^@]+)(@)", r"\1***\3", message)
+    st.session_state.db_last_error = message[:2000]
+    st.session_state.db_available = False
 
 
-MYSQL_CONNECT_RETRIES = 4
-MYSQL_RETRY_DELAYS = (1.0, 2.0, 4.0, 6.0)
-
-
-def _is_transient_mysql_connection_error(error):
-    """Return True for connection/DNS failures that are reasonable to retry."""
-    if isinstance(error, socket.gaierror):
-        return True
-
-    error_text = str(error or "").lower()
-    transient_markers = (
-        "unknown mysql server host",
-        "temporary failure in name resolution",
-        "name or service not known",
-        "nodename nor servname provided",
-        "getaddrinfo failed",
-        "can't connect to mysql server",
-        "can't connect to mysql server on",
-        "connection timed out",
-        "timed out",
-        "connection reset",
-        "connection refused",
-        "server has gone away",
-        "lost connection",
-        "2003",
-        "2005",
-        "2013",
-        "2055",
+@st.cache_resource(show_spinner=False)
+def _get_cached_mongo_client(uri):
+    """Create a thread-safe MongoClient with built-in connection pooling."""
+    return MongoClient(
+        uri,
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000,
+        socketTimeoutMS=15000,
+        retryWrites=True,
     )
-    return any(marker in error_text for marker in transient_markers)
 
 
-def get_mysql_connection():
-    """
-    Create a fresh MySQL connection with retry handling for transient DNS,
-    network and Aiven connection failures. A fresh connection is intentional
-    because Streamlit reruns the script frequently.
-    """
-    if not all([mysql_host, mysql_port, mysql_database, mysql_user, mysql_password]):
-        _set_mysql_error(
-            "MySQL configuration is incomplete. Required: MYSQL_HOST, "
-            "MYSQL_PORT, MYSQL_DATABASE, MYSQL_USER and MYSQL_PASSWORD."
+def get_mongo_db():
+    """Return the active MongoDB database object, or None if unavailable."""
+    if not mongodb_uri:
+        _set_db_error(
+            "MongoDB configuration is incomplete. Required: MONGODB_URI in .env or Streamlit Secrets."
         )
         return None
 
     try:
-        port = int(str(mysql_port).strip())
-        if not 1 <= port <= 65535:
-            raise ValueError("MYSQL_PORT must be between 1 and 65535.")
-    except (TypeError, ValueError) as error:
-        _set_mysql_error(f"Invalid MySQL port: {error}")
+        mongo_client = _get_cached_mongo_client(mongodb_uri)
+        # Verify the server is reachable
+        mongo_client.admin.command("ping")
+        db = mongo_client[mongodb_database]
+        st.session_state.db_last_error = ""
+        st.session_state.db_available = True
+        return db
+    except Exception as error:
+        _set_db_error(f"MongoDB connection failed: {error}")
         return None
 
-    host = str(mysql_host).strip()
-    connection_options = {
-        "host": host,
-        "port": port,
-        "database": str(mysql_database).strip(),
-        "user": str(mysql_user).strip(),
-        "password": str(mysql_password),
-        "connection_timeout": 15,
-        "autocommit": False,
-        # Aiven requires TLS. For normal Aiven connections the connector
-        # negotiates TLS without requiring a locally downloaded CA file.
-        "ssl_disabled": False,
-        "ssl_verify_cert": mysql_ssl_verify_cert,
-        "ssl_verify_identity": mysql_ssl_verify_identity,
-    }
 
-    if mysql_ssl_ca:
-        connection_options["ssl_ca"] = str(mysql_ssl_ca).strip()
-        # When a CA is explicitly supplied, certificate verification is
-        # enabled unless the user deliberately disabled it in config.
-        if "MYSQL_SSL_VERIFY_CERT" not in os.environ:
-            connection_options["ssl_verify_cert"] = True
-
-    last_error = None
-
-    for attempt in range(1, MYSQL_CONNECT_RETRIES + 1):
-        try:
-            connection = mysql.connector.connect(**connection_options)
-            st.session_state.mysql_last_error = ""
-            st.session_state.mysql_available = True
-            return connection
-
-        except Exception as error:
-            last_error = error
-
-            # Authentication, database-not-found, permission and TLS
-            # configuration errors are not fixed by repeatedly reconnecting.
-            if not _is_transient_mysql_connection_error(error):
-                break
-
-            if attempt < MYSQL_CONNECT_RETRIES:
-                delay = MYSQL_RETRY_DELAYS[min(attempt - 1, len(MYSQL_RETRY_DELAYS) - 1)]
-                time.sleep(delay)
-
-    _set_mysql_error(
-        f"MySQL connection failed after {MYSQL_CONNECT_RETRIES} attempts: {last_error}"
-    )
-    return None
-
-
-def test_mysql_connection():
-    """Return (True, message) only when the database is actually reachable."""
-    connection = get_mysql_connection()
-    if connection is None:
-        return False, st.session_state.get("mysql_last_error") or "MySQL connection failed."
+def test_db_connection():
+    """Return (True, message) only when MongoDB Atlas is reachable."""
+    db = get_mongo_db()
+    if db is None:
+        return False, st.session_state.get("db_last_error") or "MongoDB connection failed."
 
     try:
-        cursor = connection.cursor()
-        cursor.execute("SELECT DATABASE(), VERSION()")
-        row = cursor.fetchone()
-        cursor.close()
-        connection.close()
-        database_name = row[0] if row else mysql_database
-        version = row[1] if row and len(row) > 1 else "unknown"
-        return True, f"Connected to MySQL database '{database_name}' (server {version})."
+        server_info = db.client.server_info()
+        version = server_info.get("version", "unknown")
+        return True, f"Connected to MongoDB Atlas database '{db.name}' (server v{version})."
     except Exception as error:
-        _set_mysql_error(f"MySQL test query failed: {error}")
-        try:
-            connection.close()
-        except Exception:
-            pass
-        return False, st.session_state.get("mysql_last_error") or "MySQL test query failed."
+        _set_db_error(f"MongoDB test query failed: {error}")
+        return False, st.session_state.get("db_last_error") or "MongoDB test query failed."
 
-def ensure_mysql_schema():
-    """Ensure the required chat-history schema exists."""
-    connection = get_mysql_connection()
-    if connection is None:
+
+def ensure_db_schema():
+    """Ensure required MongoDB collections and indexes exist."""
+    db = get_mongo_db()
+    if db is None:
         return False
 
-    cursor = connection.cursor()
-
     try:
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                date_of_birth DATE NOT NULL,
-                gender VARCHAR(30),
-                profession VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY unique_user_identity (name, date_of_birth)
-            )
-            """
+        # Index on users for fast case-insensitive lookup by normalized name + DOB
+        db.users.create_index(
+            [("name_lower", pymongo.ASCENDING), ("date_of_birth", pymongo.ASCENDING)],
+            unique=True,
+            name="unique_user_identity",
         )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chats (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                pinned TINYINT(1) NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    ON UPDATE CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id)
-                    REFERENCES users(id)
-                    ON DELETE CASCADE
-            )
-            """
+        # Index on chats for fast retrieval sorted by pinned & updated_at
+        db.chats.create_index(
+            [
+                ("user_id", pymongo.ASCENDING),
+                ("pinned", pymongo.DESCENDING),
+                ("updated_at", pymongo.DESCENDING),
+            ],
+            name="user_chats_sort_idx",
         )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                chat_id INT NOT NULL,
-                role ENUM('user', 'assistant') NOT NULL,
-                content LONGTEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (chat_id)
-                    REFERENCES chats(id)
-                    ON DELETE CASCADE
-            )
-            """
-        )
-
-        cursor.execute("SHOW COLUMNS FROM chats LIKE 'pinned'")
-        if cursor.fetchone() is None:
-            cursor.execute(
-                "ALTER TABLE chats ADD COLUMN pinned TINYINT(1) NOT NULL DEFAULT 0"
-            )
-
-        connection.commit()
-        st.session_state.mysql_available = True
-        st.session_state.mysql_last_error = ""
+        st.session_state.db_available = True
+        st.session_state.db_last_error = ""
         return True
-
     except Exception as error:
-        connection.rollback()
-        _set_mysql_error(f"MySQL schema setup failed: {error}")
+        _set_db_error(f"MongoDB index setup failed: {error}")
         return False
 
-    finally:
-        cursor.close()
-        connection.close()
 
-
-def get_or_create_mysql_user(name, dob, gender, profession):
+def get_or_create_db_user(name, dob, gender, profession):
     """Match account only by name + date of birth; create if no match exists."""
-    connection = get_mysql_connection()
-    if connection is None:
-        return None, False, st.session_state.get("mysql_last_error") or "MySQL connection is not configured."
+    db = get_mongo_db()
+    if db is None:
+        return None, False, st.session_state.get("db_last_error") or "MongoDB connection is not configured."
 
-    cursor = connection.cursor(dictionary=True)
     normalized_name = " ".join(name.strip().split())
+    name_lower = normalized_name.lower()
+    dob_iso = dob.isoformat() if isinstance(dob, (date, datetime)) else str(dob)
+    now = datetime.now(INDIA_TIMEZONE)
 
     try:
-        cursor.execute(
-            """
-            SELECT id, name, date_of_birth, gender, profession
-            FROM users
-            WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
-              AND date_of_birth = %s
-            LIMIT 1
-            """,
-            (normalized_name, dob),
+        existing_user = db.users.find_one(
+            {"name_lower": name_lower, "date_of_birth": dob_iso}
         )
-        user = cursor.fetchone()
 
-        if user:
-            cursor.execute(
-                """
-                UPDATE users
-                SET gender = %s
-                WHERE id = %s
-                """,
-                (gender, user["id"]),
+        if existing_user:
+            db.users.update_one(
+                {"_id": existing_user["_id"]},
+                {"$set": {"gender": gender, "updated_at": now}},
             )
-            connection.commit()
-            return user["id"], False, None
+            return str(existing_user["_id"]), False, None
 
-        try:
-            cursor.execute(
-                """
-                INSERT INTO users (name, date_of_birth, gender, profession)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (normalized_name, dob, gender, ""),
-            )
-            connection.commit()
-            return cursor.lastrowid, True, None
-        except mysql.connector.Error as error:
-            # A simultaneous login may have created the same identity.
-            if getattr(error, "errno", None) == 1062:
-                connection.rollback()
-                cursor.execute(
-                    """
-                    SELECT id
-                    FROM users
-                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))
-                      AND date_of_birth = %s
-                    LIMIT 1
-                    """,
-                    (normalized_name, dob),
-                )
-                user = cursor.fetchone()
-                if user:
-                    return user["id"], False, None
-            raise
+        new_user_doc = {
+            "name": normalized_name,
+            "name_lower": name_lower,
+            "date_of_birth": dob_iso,
+            "gender": gender,
+            "profession": profession or "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        result = db.users.insert_one(new_user_doc)
+        return str(result.inserted_id), True, None
+
+    except pymongo.errors.DuplicateKeyError:
+        existing_user = db.users.find_one(
+            {"name_lower": name_lower, "date_of_birth": dob_iso}
+        )
+        if existing_user:
+            return str(existing_user["_id"]), False, None
+        return None, False, "Duplicate user identity conflict."
 
     except Exception as error:
-        connection.rollback()
+        _set_db_error(f"Could not load/create user: {error}")
         return None, False, str(error)
 
-    finally:
-        cursor.close()
-        connection.close()
 
-
-def load_mysql_chat_history(user_id):
-    """Load all saved chats and messages belonging only to this user."""
-    connection = get_mysql_connection()
-    if connection is None:
+def load_db_chat_history(user_id):
+    """Load all saved chats and embedded messages belonging to this user."""
+    db = get_mongo_db()
+    if db is None:
         return []
-
-    cursor = connection.cursor(dictionary=True)
 
     try:
-        cursor.execute(
-            """
-            SELECT
-                c.id AS chat_id,
-                c.title,
-                c.pinned,
-                m.role,
-                m.content
-            FROM chats c
-            LEFT JOIN messages m ON m.chat_id = c.id
-            WHERE c.user_id = %s
-            ORDER BY c.pinned DESC, c.updated_at DESC, m.id ASC
-            """,
-            (user_id,),
+        cursor = db.chats.find({"user_id": str(user_id)}).sort(
+            [("pinned", pymongo.DESCENDING), ("updated_at", pymongo.DESCENDING)]
         )
 
-        rows = cursor.fetchall()
-        chats = {}
-        order = []
-
-        for row in rows:
-            chat_id = row["chat_id"]
-
-            if chat_id not in chats:
-                chats[chat_id] = {
-                    "id": chat_id,
-                    "title": row["title"],
-                    "messages": [],
-                    "pinned": bool(row["pinned"]),
+        chats = []
+        for doc in cursor:
+            raw_messages = doc.get("messages", [])
+            clean_messages = [
+                {"role": m["role"], "content": m["content"]}
+                for m in raw_messages
+                if m.get("role") and m.get("content") is not None
+            ]
+            chats.append(
+                {
+                    "id": str(doc["_id"]),
+                    "title": doc.get("title", "New Chat"),
+                    "messages": clean_messages,
+                    "pinned": bool(doc.get("pinned", False)),
                 }
-                order.append(chat_id)
-
-            if row["role"] and row["content"] is not None:
-                chats[chat_id]["messages"].append(
-                    {
-                        "role": row["role"],
-                        "content": row["content"],
-                    }
-                )
-
-        return [chats[chat_id] for chat_id in order]
+            )
+        return chats
 
     except Exception as error:
-        _set_mysql_error(f"Could not load chat history: {error}")
+        _set_db_error(f"Could not load chat history: {error}")
         return []
 
-    finally:
-        cursor.close()
-        connection.close()
+
+def create_db_chat(user_id, first_user_message):
+    """Create one persistent NoSQL chat document and return its string ID."""
+    db = get_mongo_db()
+    if db is None:
+        return None
+
+    title = " ".join(str(first_user_message).split())[:55]
+    now = datetime.now(INDIA_TIMEZONE)
+
+    try:
+        chat_doc = {
+            "user_id": str(user_id),
+            "title": title,
+            "pinned": False,
+            "messages": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+        result = db.chats.insert_one(chat_doc)
+        return str(result.inserted_id)
+    except Exception as error:
+        _set_db_error(f"Could not create chat: {error}")
+        return None
 
 
-def ensure_active_mysql_chat(first_user_message):
+def ensure_active_db_chat(first_user_message):
     """Create the current chat on first message when a user is logged in."""
-    if not st.session_state.mysql_user_id:
+    if not st.session_state.db_user_id:
         return None
 
     if st.session_state.active_chat_id:
         return st.session_state.active_chat_id
 
-    chat_id = create_mysql_chat(
-        st.session_state.mysql_user_id,
+    chat_id = create_db_chat(
+        st.session_state.db_user_id,
         first_user_message,
     )
 
@@ -1457,126 +1264,87 @@ def ensure_active_mysql_chat(first_user_message):
     return chat_id
 
 
-def create_mysql_chat(user_id, first_user_message):
-    """Create one persistent chat and return its database ID."""
-    connection = get_mysql_connection()
-    if connection is None:
-        return None
+def _to_object_id(chat_id):
+    """Safely convert string chat_id to MongoDB ObjectId."""
+    try:
+        return ObjectId(str(chat_id))
+    except Exception:
+        return str(chat_id)
 
-    cursor = connection.cursor()
-    title = " ".join(str(first_user_message).split())[:55]
+
+def save_db_message(chat_id, role, content):
+    """Append one chat message directly into the chat document's messages array."""
+    db = get_mongo_db()
+    if db is None:
+        return False
+
+    now = datetime.now(INDIA_TIMEZONE)
 
     try:
-        cursor.execute(
-            """
-            INSERT INTO chats (user_id, title)
-            VALUES (%s, %s)
-            """,
-            (user_id, title),
+        result = db.chats.update_one(
+            {"_id": _to_object_id(chat_id)},
+            {
+                "$push": {
+                    "messages": {
+                        "role": role,
+                        "content": str(content),
+                        "created_at": now,
+                    }
+                },
+                "$set": {"updated_at": now},
+            },
         )
-        connection.commit()
-        return cursor.lastrowid
+        return result.modified_count > 0
     except Exception as error:
-        connection.rollback()
-        _set_mysql_error(f"Could not create chat: {error}")
-        return None
-    finally:
-        cursor.close()
-        connection.close()
-
-
-def save_mysql_message(chat_id, role, content):
-    """Persist one chat message."""
-    connection = get_mysql_connection()
-    if connection is None:
+        _set_db_error(f"Could not save chat message: {error}")
         return False
 
-    cursor = connection.cursor()
+
+def update_db_chat_pin(chat_id, pinned):
+    db = get_mongo_db()
+    if db is None:
+        return False
 
     try:
-        cursor.execute(
-            """
-            INSERT INTO messages (chat_id, role, content)
-            VALUES (%s, %s, %s)
-            """,
-            (chat_id, role, str(content)),
+        db.chats.update_one(
+            {
+                "_id": _to_object_id(chat_id),
+                "user_id": str(st.session_state.db_user_id),
+            },
+            {"$set": {"pinned": bool(pinned)}},
         )
-        cursor.execute(
-            "UPDATE chats SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-            (chat_id,),
-        )
-        connection.commit()
-        return True
-    except Exception as error:
-        connection.rollback()
-        _set_mysql_error(f"Could not save chat message: {error}")
-        return False
-    finally:
-        cursor.close()
-        connection.close()
-
-
-def update_mysql_chat_pin(chat_id, pinned):
-    connection = get_mysql_connection()
-    if connection is None:
-        return False
-
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "UPDATE chats SET pinned = %s WHERE id = %s AND user_id = %s",
-            (1 if pinned else 0, chat_id, st.session_state.mysql_user_id),
-        )
-        connection.commit()
         return True
     except Exception:
-        connection.rollback()
-        return False
-    finally:
-        cursor.close()
-        connection.close()
-
-
-def delete_mysql_chat(chat_id):
-    connection = get_mysql_connection()
-    if connection is None:
         return False
 
-    cursor = connection.cursor()
+
+def delete_db_chat(chat_id):
+    db = get_mongo_db()
+    if db is None:
+        return False
+
     try:
-        cursor.execute(
-            "DELETE FROM chats WHERE id = %s AND user_id = %s",
-            (chat_id, st.session_state.mysql_user_id),
+        db.chats.delete_one(
+            {
+                "_id": _to_object_id(chat_id),
+                "user_id": str(st.session_state.db_user_id),
+            }
         )
-        connection.commit()
         return True
     except Exception:
-        connection.rollback()
-        return False
-    finally:
-        cursor.close()
-        connection.close()
-
-
-def delete_all_mysql_chats():
-    connection = get_mysql_connection()
-    if connection is None:
         return False
 
-    cursor = connection.cursor()
+
+def delete_all_db_chats():
+    db = get_mongo_db()
+    if db is None:
+        return False
+
     try:
-        cursor.execute(
-            "DELETE FROM chats WHERE user_id = %s",
-            (st.session_state.mysql_user_id,),
-        )
-        connection.commit()
+        db.chats.delete_many({"user_id": str(st.session_state.db_user_id)})
         return True
     except Exception:
-        connection.rollback()
         return False
-    finally:
-        cursor.close()
-        connection.close()
 
 
 def clean_answer_for_display(answer):
@@ -1590,10 +1358,10 @@ def clean_answer_for_display(answer):
 
 
 def save_current_chat():
-    """Keep guest chats in session; logged-in chats are already in MySQL."""
+    """Keep guest chats in session; logged-in chats are already in MongoDB."""
     messages = st.session_state.messages
 
-    if not messages or st.session_state.mysql_user_id:
+    if not messages or st.session_state.db_user_id:
         return
 
     first_user_message = next(
@@ -1615,7 +1383,7 @@ def save_current_chat():
 
     st.session_state.chat_history.append(
         {
-            "id": datetime.now().timestamp(),
+            "id": str(datetime.now().timestamp()),
             "title": title,
             "messages": messages.copy(),
             "pinned": False,
@@ -1624,7 +1392,7 @@ def save_current_chat():
 
 
 def start_new_chat():
-    if st.session_state.messages and not st.session_state.mysql_user_id:
+    if st.session_state.messages and not st.session_state.db_user_id:
         save_current_chat()
 
     st.session_state.messages = []
@@ -1635,8 +1403,8 @@ def pin_chat(chat_id):
     for chat in st.session_state.chat_history:
         if chat["id"] == chat_id:
             chat["pinned"] = not chat["pinned"]
-            if st.session_state.mysql_user_id:
-                update_mysql_chat_pin(
+            if st.session_state.db_user_id:
+                update_db_chat_pin(
                     chat_id,
                     chat["pinned"],
                 )
@@ -1644,8 +1412,8 @@ def pin_chat(chat_id):
 
 
 def delete_chat(chat_id):
-    if st.session_state.mysql_user_id:
-        delete_mysql_chat(chat_id)
+    if st.session_state.db_user_id:
+        delete_db_chat(chat_id)
 
     st.session_state.chat_history = [
         chat
@@ -1656,7 +1424,6 @@ def delete_chat(chat_id):
     if st.session_state.active_chat_id == chat_id:
         st.session_state.active_chat_id = None
         st.session_state.messages = []
-
 
 
 def connect_google_sheet():
@@ -1948,13 +1715,7 @@ Avoid:
 
 
 def _direct_web_search(query, max_results=7):
-    """Search the public web and aggregate multiple providers before ranking.
-
-    Important: do NOT return the first provider's results. A first-result-only
-    strategy can miss the authoritative page and can cause the final model to
-    confuse two different meanings of the same number (for example, IBM has
-    more than one 56% statistic in 2026 cybersecurity material).
-    """
+    """Search the public web and aggregate multiple providers before ranking."""
     query = re.sub(r"\s+", " ", str(query or "").strip())[:500]
     if not query:
         raise ValueError("The web-search question is empty.")
@@ -1978,9 +1739,6 @@ def _direct_web_search(query, max_results=7):
         "Cache-Control": "no-cache",
     }
 
-    # Prefer authoritative first-party sources when the question names an
-    # organization. This is especially important for statistics and release
-    # dates. These are ranking hints, not factual answers.
     entity_domains = []
     q_lower = query.lower()
     entity_map = {
@@ -2000,8 +1758,6 @@ def _direct_web_search(query, max_results=7):
 
     queries = [query]
     if entity_domains:
-        # Search engines generally understand site: filters better than relying
-        # on snippets from unrelated publishers.
         queries.append(f"site:{entity_domains[0]} {query}"[:500])
 
     all_results = []
@@ -2116,14 +1872,12 @@ def _direct_web_search(query, max_results=7):
         except Exception as error:
             errors.append(f"Google: {type(error).__name__}: {error}")
 
-    # Deduplicate URLs and rank authoritative sources above generic results.
     deduped = {}
     for item in all_results:
         key = item["url"].rstrip("/")
         if key not in deduped:
             deduped[key] = item
         else:
-            # Keep the richer snippet if providers returned the same page.
             if len(item.get("content", "")) > len(deduped[key].get("content", "")):
                 deduped[key] = item
 
@@ -2159,12 +1913,7 @@ def _direct_web_search(query, max_results=7):
     return results[:max(10, max_results)]
 
 def _extract_numeric_evidence_ledger(evidence):
-    """Build an exact-sentence ledger for numbers/statistics in web evidence.
-
-    The model is allowed to use a number only together with the metric/object
-    stated in the same source sentence. This prevents errors such as taking
-    "56% increase in AI-driven attacks" and attaching 56% to "breach costs".
-    """
+    """Build an exact-sentence ledger for numbers/statistics in web evidence."""
     numeric_pattern = re.compile(
         r"(?:\$\s?\d[\d,.]*(?:\s?(?:million|billion|trillion|M|B|K))?|"
         r"\d[\d,.]*\s?%|"
@@ -2174,8 +1923,6 @@ def _extract_numeric_evidence_ledger(evidence):
     ledger = []
     for source_index, item in enumerate(evidence, start=1):
         content = str(item.get("content", ""))
-        # Sentence splitting is intentionally conservative; keep the full
-        # sentence so the metric/object remains attached to the number.
         sentences = re.split(r"(?<=[.!?])\s+", content)
         for sentence in sentences:
             sentence = re.sub(r"\s+", " ", sentence).strip()
@@ -2198,12 +1945,7 @@ def _answer_has_numeric_claim(answer):
 
 
 def _validate_answer_numeric_claims(answer, evidence, ledger):
-    """Conservatively validate numeric claims before showing them to the user.
-
-    Every numeric token in an answer must appear in the evidence. If the
-    answer contains a statistic whose exact number cannot be located in the
-    evidence, reject the answer rather than guessing.
-    """
+    """Conservatively validate numeric claims before showing them to the user."""
     if not answer:
         return False
     if not _answer_has_numeric_claim(answer):
@@ -2228,8 +1970,6 @@ def _validate_answer_numeric_claims(answer, evidence, ledger):
         if norm_number(number) not in normalized_evidence:
             return False
 
-    # The ledger must exist whenever a numeric claim is made. It gives the
-    # verifier the exact source sentence containing the number and its metric.
     return bool(ledger.strip())
 
 
@@ -2305,8 +2045,6 @@ def _validate_numeric_metric_pairings(answer, evidence):
                     best_overlap = overlap
                     best_sentence = source_sentence
 
-            # A numeric claim must share at least two meaningful metric words
-            # or a strong lexical overlap with the exact source sentence.
             if best_overlap < 0.34:
                 return False, (
                     f"Number {number} is present in the sources, but the answer "
@@ -2469,8 +2207,6 @@ Return only the answer with inline [S#] citations.
 
     numeric_ok, numeric_reason = _validate_numeric_metric_pairings(answer, evidence)
     if not numeric_ok:
-        # One final rewrite is allowed. If it still fails deterministic validation,
-        # do not display a potentially misleading statistic.
         retry_prompt = f"""
 Correct the answer below using ONLY the exact numeric evidence.
 
@@ -2508,7 +2244,6 @@ ANSWER:
             pass
 
     if not numeric_ok:
-        # Safe fallback: no fabricated statistic.
         answer = (
             "I couldn't verify the exact meaning of the numeric figure from the "
             "retrieved sources without risking attaching it to the wrong metric. "
@@ -2520,7 +2255,6 @@ ANSWER:
 
 
 def get_chat_response(user_message):
-    # Keep the request small enough for the API even after RAG context is added.
     user_message = str(user_message).strip()[:4000]
     recent_messages = st.session_state.messages[-6:]
 
@@ -2550,8 +2284,6 @@ def get_chat_response(user_message):
         st.session_state.last_rag_topic = None
         st.session_state.last_rag_sources = []
 
-    # BBDU remains strictly official-RAG-only. Other topics can use web search
-    # when current information is explicitly needed or Web Search is enabled.
     needs_web = (
         st.session_state.web_search
         and is_current_information_question(user_message)
@@ -2600,7 +2332,6 @@ def prepare_image_for_vision(image_bytes, image_mime):
     if not image_bytes:
         raise ValueError("The uploaded image is empty.")
 
-    # Small files can be sent without recompression.
     if len(image_bytes) <= MAX_IMAGE_API_BYTES:
         return image_bytes, image_mime or "image/jpeg"
 
@@ -2608,15 +2339,12 @@ def prepare_image_for_vision(image_bytes, image_mime):
         image = Image.open(io.BytesIO(image_bytes))
         image.load()
 
-        # Preserve screenshots/photos while converting unsupported modes to RGB.
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGB")
 
-        # Start with a reasonable resolution for OCR and screenshots.
         image.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
         image = image.convert("RGB")
 
-        # Repeatedly compress, then reduce dimensions if necessary.
         dimensions = [
             (2200, 2200),
             (1900, 1900),
@@ -2660,10 +2388,6 @@ def prepare_image_for_vision(image_bytes, image_mime):
 
 @st.cache_resource(show_spinner=False)
 def _get_accessible_vision_models():
-    """
-    Discover which supported Groq vision models are actually available to
-    the current API key/project.
-    """
     try:
         model_page = client.models.list()
         available_ids = {
@@ -2678,15 +2402,12 @@ def _get_accessible_vision_models():
         if discovered:
             return discovered
     except Exception:
-        # If model listing is unavailable, try the known current candidates
-        # directly. The actual request remains the final authority.
         pass
 
     return list(VISION_MODEL_CANDIDATES)
 
 
 def _is_model_not_found_error(error):
-    """Return True for Groq errors indicating the selected model is unavailable."""
     error_text = str(error).lower()
     return (
         "model_not_found" in error_text
@@ -2697,7 +2418,6 @@ def _is_model_not_found_error(error):
 
 
 def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
-    """Call the current Groq vision model with a configurable output budget."""
     candidate_models = _get_accessible_vision_models()
     last_model_error = None
 
@@ -2717,8 +2437,6 @@ def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
                 last_model_error = first_error
                 continue
 
-            # If Groq reports an output-token-per-minute limit, retry with a
-            # smaller budget rather than failing the whole image request.
             is_otpm_limit = (
                 "429" in error_text
                 and (
@@ -2728,7 +2446,6 @@ def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
                 )
             )
             if is_otpm_limit:
-                # Groq may expose retry-after on the SDK exception response.
                 retry_after = 2.0
                 try:
                     headers = getattr(getattr(first_error, "response", None), "headers", {}) or {}
@@ -2762,7 +2479,6 @@ def _call_vision_model(messages_for_ai, max_completion_tokens=3500):
 
 
 def _build_vision_messages(user_message, image_infos, rag_context, rag_topic, bounded_messages, evidence_only=False):
-    """Build one Groq vision request for the supplied image batch."""
     vision_rules = """
 IMAGE / CODE DEBUGGING MODE
 
@@ -2915,20 +2631,7 @@ numbers where useful. Do not speculate.
     return messages_for_ai
 
 
-def _is_image_count_limit_error(error):
-    """Detect a vision-model error caused by too many images in one request."""
-    text = str(error).lower()
-    return (
-        "maximum" in text and "image" in text
-        or "max" in text and "image" in text
-        or "too many images" in text
-        or "3 images" in text
-        or "image limit" in text
-    )
-
-
 def _synthesize_multi_batch_image_answer(user_message, evidence_parts):
-    """Synthesize batched visual evidence into a complete, ordered answer."""
     evidence_text = "\n\n".join(evidence_parts)
     synthesis_prompt = f"""
 You are the final answer writer for Aether-AD27. The user uploaded up to five images,
@@ -2985,7 +2688,6 @@ Return a polished answer suitable for submitting as study/assignment notes.
 
 
 def get_image_chat_response(user_message, uploaded_images):
-    """Answer the user's prompt from up to five uploaded images."""
     user_message = str(user_message).strip()[:4000]
 
     if not uploaded_images:
@@ -3024,8 +2726,6 @@ def get_image_chat_response(user_message, uploaded_images):
 
     indexed_images = list(enumerate(uploaded_images, start=1))
 
-    # Current Qwen 3.8 accepts at most 3 images/request. For 4-5 images,
-    # batch as 3+2 immediately instead of making a failed 5-image request.
     if len(indexed_images) > 3:
         evidence_parts = []
         for batch_start in range(0, len(indexed_images), 3):
@@ -3055,8 +2755,6 @@ def get_image_chat_response(user_message, uploaded_images):
                     f"Images {batch[0][0]}-{batch[-1][0]} evidence:\n{batch_answer}"
                 )
 
-            # Avoid immediately stacking another Qwen request into the same
-            # token window on rate-limited Groq developer keys.
             if batch_start + 3 < len(indexed_images):
                 time.sleep(2.5)
 
@@ -3080,8 +2778,6 @@ def get_image_chat_response(user_message, uploaded_images):
             rag_topic,
         )
 
-    # For one image, allow a large enough response for multi-question assignments.
-    # For two/three images, keep the budget conservative enough for Groq TPM limits.
     output_budget = 3500 if len(indexed_images) == 1 else 2000
 
     try:
@@ -3147,7 +2843,7 @@ with st.sidebar:
         st.caption("Your Personal AI Assistant")
 
     if st.session_state.user_profile:
-        st.caption("🗄️ MySQL history: Connected")
+        st.caption("🍃 MongoDB Atlas (NoSQL): Connected")
 
     st.divider()
 
@@ -3172,10 +2868,10 @@ with st.sidebar:
                 "🚪 Logout / Switch Account",
                 use_container_width=True,
             ):
-                if st.session_state.messages and not st.session_state.mysql_user_id:
+                if st.session_state.messages and not st.session_state.db_user_id:
                     save_current_chat()
                 st.session_state.user_profile = None
-                st.session_state.mysql_user_id = None
+                st.session_state.db_user_id = None
                 st.session_state.active_chat_id = None
                 st.session_state.messages = []
                 st.session_state.chat_history = []
@@ -3247,20 +2943,20 @@ with st.sidebar:
             elif user_gender == "Select Gender":
                 st.warning("Please select your gender.")
 
-            elif not ensure_mysql_schema():
+            elif not ensure_db_schema():
                 st.error(
-                    "❌ MySQL could not be reached. Please check that MySQL is running "
-                    "and your .env / Streamlit Secrets contain the correct database settings."
+                    "❌ MongoDB Atlas could not be reached. Please check that your "
+                    ".env / Streamlit Secrets contain a valid MONGODB_URI."
                 )
-                with st.expander("🔧 MySQL diagnostic", expanded=True):
+                with st.expander("🔧 MongoDB diagnostic", expanded=True):
                     st.code(
-                        st.session_state.get("mysql_last_error")
-                        or "No MySQL diagnostic was returned.",
+                        st.session_state.get("db_last_error")
+                        or "No MongoDB diagnostic was returned.",
                         language="text",
                     )
 
             else:
-                user_id, is_new, db_error = get_or_create_mysql_user(
+                user_id, is_new, db_error = get_or_create_db_user(
                     user_name,
                     user_dob,
                     user_gender,
@@ -3270,14 +2966,14 @@ with st.sidebar:
                 if not user_id:
                     st.error(
                         "❌ Account could not be loaded. "
-                        "Please check the MySQL configuration."
+                        "Please check the MongoDB configuration."
                     )
                     if db_error:
                         with st.expander("🔧 Technical Details"):
                             st.code(db_error)
                 else:
-                    st.session_state.mysql_user_id = user_id
-                    st.session_state.mysql_available = True
+                    st.session_state.db_user_id = user_id
+                    st.session_state.db_available = True
                     st.session_state.user_profile = {
                         "id": user_id,
                         "name": " ".join(user_name.strip().split()),
@@ -3285,7 +2981,7 @@ with st.sidebar:
                         "dob_iso": user_dob.isoformat(),
                         "gender": user_gender,
                     }
-                    st.session_state.chat_history = load_mysql_chat_history(
+                    st.session_state.chat_history = load_db_chat_history(
                         user_id
                     )
                     st.session_state.messages = []
@@ -3338,9 +3034,7 @@ with st.sidebar:
             if not chat.get("pinned")
         ]
 
-        ordered_chats = pinned_chats + list(
-            reversed(normal_chats)
-        )
+        ordered_chats = pinned_chats + normal_chats
 
         for index, chat in enumerate(ordered_chats):
 
@@ -3394,8 +3088,8 @@ with st.sidebar:
             "🗑️ Delete All History",
             use_container_width=True,
         ):
-            if st.session_state.mysql_user_id:
-                delete_all_mysql_chats()
+            if st.session_state.db_user_id:
+                delete_all_db_chats()
             st.session_state.chat_history = []
             st.session_state.messages = []
             st.session_state.active_chat_id = None
@@ -3429,24 +3123,22 @@ with st.sidebar:
             "📚 Verified RAG automatically uses trusted sources for BBDU and common programming topics."
         )
 
-        with st.expander("🗄️ Database status", expanded=False):
-            configured = bool(
-                mysql_host and mysql_port and mysql_database and mysql_user and mysql_password
-            )
+        with st.expander("🍃 Database status (MongoDB NoSQL)", expanded=False):
+            configured = bool(mongodb_uri)
             st.write(
                 f"**Configured:** {'Yes' if configured else 'No'}"
             )
-            if st.button("🔄 Test MySQL connection", use_container_width=True):
-                ok, message = test_mysql_connection()
+            if st.button("🔄 Test MongoDB connection", use_container_width=True):
+                ok, message = test_db_connection()
                 if ok:
-                    st.session_state.mysql_available = True
+                    st.session_state.db_available = True
                     st.success("✅ " + message)
                 else:
-                    st.session_state.mysql_available = False
+                    st.session_state.db_available = False
                     st.error("❌ " + message)
-            elif st.session_state.get("mysql_last_error"):
+            elif st.session_state.get("db_last_error"):
                 st.caption("Last database error:")
-                st.code(st.session_state.mysql_last_error, language="text")
+                st.code(st.session_state.db_last_error, language="text")
 
         st.caption(
             "🎨 Light/Dark theme is controlled by Streamlit's "
@@ -3535,8 +3227,6 @@ if st.session_state.user_profile:
 
     name = st.session_state.user_profile["name"]
 
-    # Always show a fresh IST-based greeting after the user profile is active.
-    # This also works when saved chat history is restored.
     st.markdown(f"# {get_personalized_greeting(name)}")
     st.caption("Your Personal AI Assistant")
 
@@ -3548,10 +3238,6 @@ if st.session_state.user_profile:
         )
 
         st.divider()
-
-        # -------------------------------------------------
-        # WELCOME / CAPABILITY CARDS
-        # -------------------------------------------------
 
         col1, col2, col3 = st.columns(3)
 
@@ -3724,7 +3410,6 @@ for message in st.session_state.messages:
                 message.get("web_sources", []),
             )
 
-            # --- BUG FIX: Updated to small Copy Icon Popover ---
             with st.popover("📋", help="Copy answer"):
                 st.code(
                     message["content"],
@@ -3734,19 +3419,6 @@ for message in st.session_state.messages:
 
 # =========================================================
 # CHAT INPUT + IMAGE ATTACHMENTS
-# =========================================================
-#
-# Uses Streamlit's native chat_input with built-in file attachments.
-# Current Streamlit supports multiple file attachments in the chat input
-# and supports pasting files/images directly into st.chat_input.
-#
-# Supported:
-#   • attachment button inside the typing bar
-#   • gallery/file picker on desktop and mobile
-#   • Native attachment/file selection supported by the installed Streamlit version
-#   • up to 5 images per message (validated server-side)
-#   • image analysis starts ONLY after the user submits a text prompt
-#   • no separate uploader above the chat box
 # =========================================================
 
 if st.session_state.user_profile is None:
@@ -3771,7 +3443,6 @@ if chat_submission is not None:
 
     uploaded_files = list(getattr(chat_submission, "files", []) or [])
 
-    # Hard server-side limit: never send more than five images.
     if len(uploaded_files) > MAX_IMAGES_PER_REQUEST:
         st.error(
             f"❌ Maximum {MAX_IMAGES_PER_REQUEST} images can be attached to one message. "
@@ -3810,8 +3481,6 @@ if chat_submission is not None:
                 "Please attach or paste it again."
             )
 
-    # An image-only submission must not trigger vision analysis. The user
-    # must explicitly provide a question/prompt first.
     if submitted_images and not user_message:
         st.warning(
             "🖼️ Your image(s) were received, but I need your question first. "
@@ -3823,9 +3492,6 @@ if chat_submission is not None:
 # PROCESS NEW QUESTION
 # =========================================================
 
-# IMPORTANT: Selecting/uploading an image must NOT call Groq by itself.
-# The image is only an attachment. Vision analysis starts after the user
-# explicitly submits a text prompt through st.chat_input.
 if user_message:
 
     current_images = list(submitted_images)
@@ -3837,26 +3503,24 @@ if user_message:
         }
     )
 
-    if st.session_state.mysql_user_id:
-        active_chat = ensure_active_mysql_chat(user_message)
+    if st.session_state.db_user_id:
+        active_chat = ensure_active_db_chat(user_message)
         if active_chat:
-            if not save_mysql_message(active_chat, "user", user_message):
+            if not save_db_message(active_chat, "user", user_message):
                 st.warning(
-                    "⚠️ Your message is visible here, but MySQL could not save it. "
+                    "⚠️ Your message is visible here, but MongoDB could not save it. "
                     "Open Settings → Database status for details."
                 )
         else:
             st.warning(
-                "⚠️ MySQL chat storage is unavailable. The answer will still work, "
+                "⚠️ MongoDB chat storage is unavailable. The answer will still work, "
                 "but this message may not be saved."
             )
 
-    # --- BUG FIX: Immediate UI Render Taaki message hide na ho ---
     with st.chat_message("user", avatar="👤"):
         st.write(user_message)
         if current_images:
             st.caption(f"📎 Attached {len(current_images)} image(s)")
-    # -------------------------------------------------------------
 
     with st.chat_message(
         "assistant",
@@ -3939,14 +3603,14 @@ if user_message:
                 }
             )
 
-            if st.session_state.mysql_user_id and st.session_state.active_chat_id:
-                if not save_mysql_message(
+            if st.session_state.db_user_id and st.session_state.active_chat_id:
+                if not save_db_message(
                     st.session_state.active_chat_id,
                     "assistant",
                     answer,
                 ):
                     st.warning(
-                        "⚠️ The AI answer was generated, but MySQL could not save the assistant message."
+                        "⚠️ The AI answer was generated, but MongoDB could not save the assistant message."
                     )
 
                 for chat in st.session_state.chat_history:
@@ -3958,8 +3622,8 @@ if user_message:
                     chat["id"] == st.session_state.active_chat_id
                     for chat in st.session_state.chat_history
                 ):
-                    st.session_state.chat_history = load_mysql_chat_history(
-                        st.session_state.mysql_user_id
+                    st.session_state.chat_history = load_db_chat_history(
+                        st.session_state.db_user_id
                     )
 
             render_source_links(
@@ -3967,7 +3631,6 @@ if user_message:
                 web_sources,
             )
 
-            # --- BUG FIX: Updated to small Copy Icon Popover ---
             with st.popover("📋", help="Copy answer"):
                 st.code(
                     answer,
@@ -4062,4 +3725,3 @@ if user_message:
                     str(error),
                     language="text",
                 )
-

@@ -6,6 +6,6 @@ google-auth
 requests
 beautifulsoup4
 scikit-learn
-mysql-connector-python
+pymongo[srv]
 Pillow
 streamlit-chat-prompt==0.4.1
