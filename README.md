@@ -28,7 +28,6 @@ The project was developed using **Python and Streamlit without HTML, CSS, or Jav
 ## ✨ Features
 
 ### 💬 AI Chat
-
 - Conversational AI powered by Groq
 - Beginner-friendly response mode
 - Programming and technical question support
@@ -36,32 +35,24 @@ The project was developed using **Python and Streamlit without HTML, CSS, or Jav
 - Current conversation memory
 
 ### 🖼️ Image Analysis
-
 - Upload images directly in the chat
 - Ask questions about uploaded images
 - AI-powered image understanding
 - Supports multiple images within the configured limits
 
 ### 🧠 RAG-Based Information Retrieval
-
-Aether-AD27 includes a lightweight Retrieval-Augmented Generation (RAG) system.
-
-It retrieves relevant information from trusted sources before generating an answer.
-
+Aether-AD27 includes a lightweight Retrieval-Augmented Generation (RAG) system. 
+It retrieves relevant information from trusted sources before generating an answer. 
 The application includes focused retrieval for:
-
 - BBDU-related information
 - Programming concepts
 - Technical topics
 
-For BBDU-related questions, the application prioritizes information retrieved from available official BBDU sources.
-
+For BBDU-related questions, the application prioritizes information retrieved from available official BBDU sources. 
 > Note: The BBDU functionality is retrieval-based. The BBDU website content is not used to train or fine-tune an AI model.
 
 ### 👤 User Accounts
-
 Users can create an account using:
-
 - Name
 - Date of Birth
 - Gender
@@ -69,29 +60,22 @@ Users can create an account using:
 User accounts allow conversations to be associated with the user's profile.
 
 ### 💾 Persistent Chat History
-
 Logged-in users can:
-
 - Save conversations
 - Create new chats
 - Restore previous conversations
 - Continue earlier conversations
-- Store chat messages in MySQL
+- **Store chat messages permanently using MongoDB Atlas (NoSQL)**
 
 ### 📝 Feedback System
-
-Users can submit feedback directly from the application.
-
+Users can submit feedback directly from the application. 
 Feedback is stored using **Google Sheets** for easy collection and review.
 
 ### 🔍 Current Information Search
-
 The application includes an optional current-information search feature for questions that require fresh information.
 
 ### 🎓 Beginner-Friendly Mode
-
 Aether-AD27 can provide explanations in a beginner-friendly format with:
-
 - Simple explanations
 - Examples
 - Step-by-step guidance
@@ -106,16 +90,16 @@ Aether-AD27 can provide explanations in a beginner-friendly format with:
 | Python | Application development |
 | Streamlit | Web application framework |
 | Groq API | AI-powered responses |
-| MySQL | User accounts and chat history |
-| Aiven | Cloud MySQL hosting |
+| MongoDB Atlas | Cloud NoSQL database for users & chat history |
+| PyMongo | Python driver for MongoDB integration |
 | Google Sheets | User feedback storage |
 | RAG | Information retrieval |
-| scikit-learn | Lightweight text retrieval |
+| scikit-learn | Lightweight text retrieval (TF-IDF) |
 | BeautifulSoup | Web content extraction |
 | Requests | Web requests |
 | python-dotenv | Environment variable management |
 | Git & GitHub | Version control |
-| Streamlit Cloud | Application deployment |
+| Streamlit Cloud | Live application deployment |
 
 ---
 
@@ -129,7 +113,7 @@ Aether-AD27 can provide explanations in a beginner-friendly format with:
                                ▼
                     ┌──────────────────────┐
                     │   Streamlit UI       │
-                    │    Aether-AD27       │
+                    │   Aether-AD27        │
                     └──────────┬───────────┘
                                │
                 ┌──────────────┼──────────────┐
@@ -148,16 +132,16 @@ Aether-AD27 can provide explanations in a beginner-friendly format with:
                                │
                                ▼
                     ┌──────────────────────┐
-                    │      MySQL           │
+                    │  MongoDB Atlas       │
+                    │      (NoSQL)         │
                     │                      │
-                    │ Users                │
-                    │ Chats                │
-                    │ Messages             │
+                    │ Users Collection     │
+                    │ Chats Collection     │
                     └──────────────────────┘
 
                                │
                                ▼
                     ┌──────────────────────┐
-                    │    Google Sheets     │
-                    │      Feedback        │
+                    │   Google Sheets      │
+                    │     Feedback         │
                     └──────────────────────┘
