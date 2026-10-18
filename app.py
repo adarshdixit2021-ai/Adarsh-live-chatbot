@@ -251,7 +251,7 @@ RAG_SOURCES = {
 
 RAG_KEYWORDS = {
     "bbdu": [
-        "bbdu", "babu banarasi das", "babu banarasi das university",
+        "bbd", "bbd university", "bbdu", "babu banarasi das", "babu banarasi das university",
         "bbdu university", "bbdu lucknow", "bbdu bca", "bbdu mca",
     ],
     "java": [
@@ -1155,6 +1155,7 @@ def get_or_create_db_user(name, dob, gender, profession):
             "profession": profession or "",
             "created_at": now,
             "updated_at": now,
+            "profession": profession or "",
         }
         result = db.users.insert_one(new_user_doc)
         return str(result.inserted_id), True, None
@@ -1588,9 +1589,16 @@ If asked who your developer is:
 "My developer is Adarsh Dixit."
 
 Adarsh Dixit is currently pursuing Bachelor of Computer Applications (BCA),
-specializing in Data Science and Artificial Intelligence.
+specializing in Data Science and Artificial Intelligence at Babu Banarasi Das University (BBDU) in Lucknow.
 
 Do not claim that Adarsh Dixit created the underlying AI model.
+
+==================================================
+CRITICAL GLOBAL RULE FOR BBD UNIVERSITY
+==================================================
+- The ONLY official website for Babu Banarasi Das University (BBD / BBDU) is: https://bbdu.ac.in
+- NEVER generate or mention links like bbduniversity.ac.in, bbduniversity.edu.in, bbd.ac.in, or any other fake variation.
+- If the user asks for the BBD University website, ALWAYS provide exactly: https://bbdu.ac.in
 
 ==================================================
 CORE ANSWER RULE
