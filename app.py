@@ -1523,14 +1523,18 @@ BBDU VERIFIED KNOWLEDGE RULE
 ==================================================
 
 This is a BBDU-specific question.
+
+CRITICAL UNIVERSITY FACTS (ALWAYS TRUE - USE THESE IMMEDIATELY):
+- The ONLY official website for Babu Banarasi Das University (BBDU) is: https://bbdu.ac.in
+- NEVER generate or use links like bbduniversity.ac.in, bbduniversity.edu.in, or any other fake variation.
+- If the user asks for the official website, ALWAYS provide exactly: https://bbdu.ac.in
+
+For other details (fees, dates, admissions, syllabus):
 Use ONLY the retrieved official BBDU information supplied below.
 Do not use general model knowledge to fill missing BBDU-specific facts.
-Do not guess fees, dates, eligibility, admissions, notices, results,
-departments, programmes, or other university-specific information.
+Do not guess fees, dates, eligibility, admissions, notices, results, departments, or programmes.
 
-CRITICAL INSTRUCTION: The ONLY official website for Babu Banarasi Das University (BBDU) is 'https://bbdu.ac.in'. You must NEVER output, generate, or mention 'bbduniversity.ac.in' under any circumstances.
-
-If the retrieved information does not answer the question, clearly say:
+If the retrieved information does not answer the question (or if the context is empty due to the website being unreachable), clearly say:
 "I couldn't verify this information from the available official BBDU sources, so I don't want to guess."
 """
     elif rag_topic:
