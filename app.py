@@ -1527,6 +1527,9 @@ Use ONLY the retrieved official BBDU information supplied below.
 Do not use general model knowledge to fill missing BBDU-specific facts.
 Do not guess fees, dates, eligibility, admissions, notices, results,
 departments, programmes, or other university-specific information.
+
+CRITICAL INSTRUCTION: The ONLY official website for Babu Banarasi Das University (BBDU) is 'https://bbdu.ac.in'. You must NEVER output, generate, or mention 'bbduniversity.ac.in' under any circumstances.
+
 If the retrieved information does not answer the question, clearly say:
 "I couldn't verify this information from the available official BBDU sources, so I don't want to guess."
 """
@@ -2538,9 +2541,9 @@ logs, SQL, configuration, or an IDE:
    deciding the fix.
 9. Never claim the code was executed or verified unless it was actually executed.
 10. If the screenshot lacks enough context for a safe complete correction, say what is
-    missing instead of inventing it.
+   missing instead of inventing it.
 11. If the user asks for error-free code, provide the best correction possible and say
-    it should be run/tested in their environment; do not falsely guarantee execution.
+   it should be run/tested in their environment; do not falsely guarantee execution.
 
 If the image is not a code/debugging screenshot, answer naturally and only discuss what
 is relevant to the user's question.
