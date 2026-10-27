@@ -1155,7 +1155,6 @@ def get_or_create_db_user(name, dob, gender, profession):
             "profession": profession or "",
             "created_at": now,
             "updated_at": now,
-            "profession": profession or "",
         }
         result = db.users.insert_one(new_user_doc)
         return str(result.inserted_id), True, None
@@ -3031,84 +3030,71 @@ with st.sidebar:
 
     st.markdown("### 💬 Chat History")
 
+    # [NEW] Search Bar for History
+    search_query = st.text_input(
+        "Search chats",
+        placeholder="🔍 Find a chat...",
+        label_visibility="collapsed"
+    ).strip().lower()
+
     if not st.session_state.chat_history:
-
         st.caption("No saved chats yet.")
-
     else:
+        # Check Search Query & Filter
+        filtered_chats = st.session_state.chat_history
+        if search_query:
+            filtered_chats = [
+                chat for chat in st.session_state.chat_history
+                if search_query in chat.get("title", "").lower()
+            ]
 
-        pinned_chats = [
-            chat
-            for chat in st.session_state.chat_history
-            if chat.get("pinned")
-        ]
+        if not filtered_chats:
+            st.caption("No chats matched your search.")
+        else:
+            pinned_chats = [
+                chat for chat in filtered_chats
+                if chat.get("pinned")
+            ]
+            normal_chats = [
+                chat for chat in filtered_chats
+                if not chat.get("pinned")
+            ]
+            ordered_chats = pinned_chats + normal_chats
 
-        normal_chats = [
-            chat
-            for chat in st.session_state.chat_history
-            if not chat.get("pinned")
-        ]
+            for index, chat in enumerate(ordered_chats):
+                row1, row2, row3 = st.columns(
+                    [7, 1, 1],
+                    gap="small",
+                )
 
-        ordered_chats = pinned_chats + normal_chats
+                with row1:
+                    prefix = "📌 " if chat.get("pinned") else "💬 "
+                    if st.button(
+                        prefix + chat["title"],
+                        key=f"open_chat_{chat['id']}_{index}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.messages = chat["messages"].copy()
+                        st.session_state.active_chat_id = chat["id"]
+                        st.rerun()
 
-        for index, chat in enumerate(ordered_chats):
+                with row2:
+                    if st.button(
+                        "📌",
+                        key=f"pin_chat_{chat['id']}_{index}",
+                        help="Pin / unpin chat",
+                    ):
+                        pin_chat(chat["id"])
+                        st.rerun()
 
-            row1, row2, row3 = st.columns(
-                [7, 1, 1],
-                gap="small",
-            )
-
-            with row1:
-
-                prefix = "📌 " if chat.get("pinned") else "💬 "
-
-                if st.button(
-                    prefix + chat["title"],
-                    key=f"open_chat_{chat['id']}_{index}",
-                    use_container_width=True,
-                ):
-
-                    st.session_state.messages = (
-                        chat["messages"].copy()
-                    )
-                    st.session_state.active_chat_id = chat["id"]
-
-                    st.rerun()
-
-            with row2:
-
-                if st.button(
-                    "📌",
-                    key=f"pin_chat_{chat['id']}_{index}",
-                    help="Pin / unpin chat",
-                ):
-
-                    pin_chat(chat["id"])
-                    st.rerun()
-
-            with row3:
-
-                if st.button(
-                    "🗑️",
-                    key=f"delete_chat_{chat['id']}_{index}",
-                    help="Delete chat",
-                ):
-
-                    delete_chat(chat["id"])
-                    st.rerun()
-
-    if st.session_state.chat_history:
-
-        if st.button(
-            "🗑️ Delete All History",
-            use_container_width=True,
-        ):
-            if st.session_state.db_user_id:
-                delete_all_db_chats()
-            st.session_state.chat_history = []
-            st.session_state.messages = []
-            st.session_state.active_chat_id = None
-            st.rerun()
+                with row3:
+                    if st.button(
+                        "🗑️",
+                        key=f"delete_chat_{chat['id']}_{index}",
+                        help="Delete chat",
+                    ):
+                        delete_chat(chat["id"])
+                        st.rerun()
 
     st.divider()
 
@@ -3137,6 +3123,42 @@ with st.sidebar:
         st.caption(
             "📚 Verified RAG automatically uses trusted sources for BBDU and common programming topics."
         )
+        
+        st.divider()
+
+        # [NEW] Data Management Section
+        st.markdown("#### 🗑️ Manage Chat Data")
+        
+        if st.session_state.chat_history:
+            # Option 1: Delete One by One
+            chat_to_delete = st.selectbox(
+                "Delete a specific chat:",
+                options=[c["id"] for c in st.session_state.chat_history],
+                format_func=lambda x: next((c["title"] for c in st.session_state.chat_history if c["id"] == x), x)
+            )
+            
+            if st.button("🗑️ Delete Selected Chat", use_container_width=True):
+                delete_chat(chat_to_delete)
+                st.success("✅ Chat permanently deleted from database!")
+                time.sleep(1)
+                st.rerun()
+            
+            st.write("") # Spacer
+
+            # Option 2: Clear All History
+            if st.button("🚨 Clear All Chat History", type="primary", use_container_width=True):
+                if st.session_state.db_user_id:
+                    delete_all_db_chats()
+                st.session_state.chat_history = []
+                st.session_state.messages = []
+                st.session_state.active_chat_id = None
+                st.success("✅ All chats permanently deleted from database!")
+                time.sleep(1)
+                st.rerun()
+        else:
+            st.caption("No chat data to manage.")
+
+        st.divider()
 
         with st.expander("🍃 Database status (MongoDB NoSQL)", expanded=False):
             configured = bool(mongodb_uri)
